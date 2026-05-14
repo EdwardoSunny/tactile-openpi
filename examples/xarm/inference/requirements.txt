@@ -1,0 +1,8 @@
+# Extra runtime deps for examples/xarm/inference/run_xarm_inference.py.
+# Install into the main openpi venv:
+#   /data/edward/openpi/.venv/bin/pip install -r examples/xarm/inference/requirements.txt
+# (Note: opencv-python is already pulled in by openpi's main deps; listed for clarity.)
+
+xArm-Python-SDK
+pyrealsense2          # only needed when running with RealSense cameras
+opencv-python
