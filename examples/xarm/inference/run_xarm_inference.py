@@ -53,6 +53,7 @@ import logging
 from pathlib import Path
 import signal
 import sys
+import threading
 import time
 from typing import Tuple
 
@@ -91,9 +92,13 @@ class XArmInferenceConfig:
     home_speed: float = 50.0  # deg/s for the homing motion
 
     # Cameras
+    # NOTE: production data collection (collect_xarm_demos.py) uses plain
+    # cv2.VideoCapture with integer USB indices — not the RealSense SDK — so we
+    # default to the same here. Use --use-realsense only if you specifically
+    # want the RealSense SDK path AND know the camera serial numbers.
     agent_cam_id: int | str = 0
     wrist_cam_id: int | str = 2
-    use_realsense: bool = True
+    use_realsense: bool = False
     image_size: int = 224
 
     # Task
@@ -135,79 +140,115 @@ def apply_tactile_overlay(img: np.ndarray, tactile_reading: np.ndarray | None) -
 # ───────── cameras ─────────
 
 
+class ThreadedCamera:
+    """Mirrors collect_xarm_demos.py's ThreadedCamera. cv2.VideoCapture in a background
+    thread that always exposes the latest frame as RGB uint8, already resized to
+    (image_size, image_size). Fails fast if the device isn't producing frames."""
+
+    def __init__(self, source: int | str, image_size: int = 224) -> None:
+        self.cap = cv2.VideoCapture(source)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Could not open camera source: {source!r}")
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # minimize buffer for freshest frame
+        self.image_size = image_size
+        self._latest: np.ndarray | None = None
+        self._stop = threading.Event()
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
+        # Warm-up — ~1 s. Raise if the camera never produces frames.
+        for _ in range(20):
+            if self._latest is not None:
+                break
+            time.sleep(0.05)
+        if self._latest is None:
+            raise RuntimeError(f"Camera {source!r} did not produce frames after warm-up")
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            ok, frame_bgr = self.cap.read()
+            if not ok or frame_bgr is None:
+                time.sleep(0.005)
+                continue
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frame_rgb = cv2.resize(
+                frame_rgb, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA
+            )
+            self._latest = frame_rgb
+
+    def read(self) -> np.ndarray:
+        assert self._latest is not None
+        return self._latest.copy()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._th.join(timeout=1.0)
+        self.cap.release()
+
+
 class CameraManager:
-    """Returns (agent, wrist) RGB uint8 frames at `image_size`×`image_size`."""
+    """Returns (agent, wrist) RGB uint8 frames at `image_size`×`image_size`.
+
+    Defaults to plain OpenCV USB capture — this is what production data
+    collection uses (collect_xarm_demos.py). Set `use_realsense=True` to go
+    through pyrealsense2 (only works with real D400 serial numbers).
+    """
 
     def __init__(self, cfg: XArmInferenceConfig) -> None:
         self.cfg = cfg
         if cfg.use_realsense:
             self._init_realsense()
         else:
-            self._init_usb()
+            self._init_threaded(cfg)
+
+    def _init_threaded(self, cfg: XArmInferenceConfig) -> None:
+        def _maybe_int(v):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return v  # leave as path / string source
+
+        agent_src = _maybe_int(cfg.agent_cam_id)
+        wrist_src = _maybe_int(cfg.wrist_cam_id)
+        log.info("Opening cameras via cv2.VideoCapture: agent=%r, wrist=%r (matching collect_xarm_demos.py)",
+                 agent_src, wrist_src)
+        self.agent_cam = ThreadedCamera(agent_src, cfg.image_size)
+        self.wrist_cam = ThreadedCamera(wrist_src, cfg.image_size)
 
     def _init_realsense(self) -> None:
-        import pyrealsense2 as rs  # local import so the script can be used with USB cams without the dep
+        # Opt-in RealSense SDK path. Requires REAL serial numbers (12-digit strings)
+        # in --agent-cam-id / --wrist-cam-id, not OpenCV indices. Use
+        # `python -c "import pyrealsense2 as rs; [print(d.get_info(rs.camera_info.serial_number)) for d in rs.context().query_devices()]"`
+        # to discover them.
+        import pyrealsense2 as rs
 
-        self._rs = rs
+        if not any(c.isdigit() for c in str(self.cfg.agent_cam_id)) or \
+           not any(c.isdigit() for c in str(self.cfg.wrist_cam_id)):
+            raise RuntimeError("--use-realsense requires real serial numbers in --agent-cam-id / --wrist-cam-id.")
+
         self.agent_pipe = rs.pipeline()
         self.wrist_pipe = rs.pipeline()
-        # Match phone_data_collection's RealSense config — 1280×720 @ 30 fps, manual exposure/WB
-        # so the live pixel statistics match training. If your collection used different
-        # settings, edit here to match.
         for pipe, dev in ((self.agent_pipe, self.cfg.agent_cam_id), (self.wrist_pipe, self.cfg.wrist_cam_id)):
             cfg_rs = rs.config()
             cfg_rs.enable_device(str(dev))
             cfg_rs.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
-            profile = pipe.start(cfg_rs)
-            sensor = profile.get_device().query_sensors()[1]
-            sensor.set_option(rs.option.enable_auto_exposure, 0)
-            sensor.set_option(rs.option.exposure, 120)
-            sensor.set_option(rs.option.gain, 0)
-            sensor.set_option(rs.option.enable_auto_white_balance, 0)
-            sensor.set_option(rs.option.white_balance, 5900)
-        # Warm-up — first few frames after option change are stale.
+            pipe.start(cfg_rs)
         for _ in range(30):
             self.agent_pipe.wait_for_frames()
             self.wrist_pipe.wait_for_frames()
-        log.info("RealSense initialized (agent=%s, wrist=%s, 1280x720@30, exp=120, wb=5900K)",
+        log.info("RealSense initialized (agent=%s, wrist=%s, 1280x720@30)",
                  self.cfg.agent_cam_id, self.cfg.wrist_cam_id)
 
-    def _init_usb(self) -> None:
-        self.agent_cap = cv2.VideoCapture(int(self.cfg.agent_cam_id))
-        self.wrist_cap = cv2.VideoCapture(int(self.cfg.wrist_cam_id))
-        if not (self.agent_cap.isOpened() and self.wrist_cap.isOpened()):
-            raise RuntimeError("Failed to open one or both USB cameras")
-        for cap in (self.agent_cap, self.wrist_cap):
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        for _ in range(10):
-            self.agent_cap.read()
-            self.wrist_cap.read()
-        log.info("USB cameras initialized (agent=%s, wrist=%s)", self.cfg.agent_cam_id, self.cfg.wrist_cam_id)
-
-    def _read_one(self, which: str) -> np.ndarray:
-        if self.cfg.use_realsense:
-            pipe = self.agent_pipe if which == "agent" else self.wrist_pipe
-            frames = pipe.wait_for_frames()
-            return np.asanyarray(frames.get_color_frame().get_data())  # BGR
-        cap = self.agent_cap if which == "agent" else self.wrist_cap
-        ok, img = cap.read()
-        if not ok:
-            raise RuntimeError(f"USB cam read failed ({which})")
-        return img  # BGR
-
     def get_observation(self) -> Tuple[np.ndarray, np.ndarray]:
-        agent_bgr = self._read_one("agent")
-        wrist_bgr = self._read_one("wrist")
-        # Training pipeline: BGR->RGB then resize to (image_size, image_size). The
-        # phone collection wrote frames already at 224×224 float32 [0,1]; we feed the
-        # policy uint8 (H,W,3) in RGB. LiberoInputs._parse_image handles both, but
-        # being explicit avoids any dtype surprises.
-        agent = cv2.resize(cv2.cvtColor(agent_bgr, cv2.COLOR_BGR2RGB),
-                           (self.cfg.image_size, self.cfg.image_size), interpolation=cv2.INTER_AREA)
-        wrist = cv2.resize(cv2.cvtColor(wrist_bgr, cv2.COLOR_BGR2RGB),
-                           (self.cfg.image_size, self.cfg.image_size), interpolation=cv2.INTER_AREA)
-        # Hook for tactile arrow overlay (no-op for the current checkpoint).
+        if self.cfg.use_realsense:
+            agent_bgr = np.asanyarray(self.agent_pipe.wait_for_frames().get_color_frame().get_data())
+            wrist_bgr = np.asanyarray(self.wrist_pipe.wait_for_frames().get_color_frame().get_data())
+            agent = cv2.resize(cv2.cvtColor(agent_bgr, cv2.COLOR_BGR2RGB),
+                               (self.cfg.image_size, self.cfg.image_size), interpolation=cv2.INTER_AREA)
+            wrist = cv2.resize(cv2.cvtColor(wrist_bgr, cv2.COLOR_BGR2RGB),
+                               (self.cfg.image_size, self.cfg.image_size), interpolation=cv2.INTER_AREA)
+        else:
+            agent = self.agent_cam.read()  # already RGB uint8 at image_size
+            wrist = self.wrist_cam.read()
         agent = apply_tactile_overlay(agent, None)
         wrist = apply_tactile_overlay(wrist, None)
         return agent, wrist
@@ -217,8 +258,8 @@ class CameraManager:
             self.agent_pipe.stop()
             self.wrist_pipe.stop()
         else:
-            self.agent_cap.release()
-            self.wrist_cap.release()
+            self.agent_cam.close()
+            self.wrist_cam.close()
 
 
 # ───────── xArm controller ─────────
@@ -477,8 +518,10 @@ def parse_args() -> XArmInferenceConfig:
     p.add_argument("--control-hz", type=int, default=10)
     p.add_argument("--agent-cam-id", type=str, default="0")
     p.add_argument("--wrist-cam-id", type=str, default="2")
-    p.add_argument("--use-usb-cameras", action="store_true",
-                   help="Use OpenCV USB capture instead of RealSense.")
+    p.add_argument("--use-realsense", action="store_true",
+                   help="Use pyrealsense2 with real D400 serial numbers in --agent-cam-id / "
+                        "--wrist-cam-id. Default is plain cv2.VideoCapture with USB indices, "
+                        "matching production data collection (collect_xarm_demos.py).")
     p.add_argument("--prompt", type=str, default="pick up the red block")
     p.add_argument("--max-steps", type=int, default=200)
     p.add_argument("--replan-steps", type=int, default=5)
@@ -499,7 +542,7 @@ def parse_args() -> XArmInferenceConfig:
         control_hz=args.control_hz,
         agent_cam_id=args.agent_cam_id,
         wrist_cam_id=args.wrist_cam_id,
-        use_realsense=not args.use_usb_cameras,
+        use_realsense=args.use_realsense,
         prompt=args.prompt,
         max_steps=args.max_steps,
         replan_steps=args.replan_steps,

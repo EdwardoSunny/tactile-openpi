@@ -171,7 +171,24 @@ If the arm happens to be at the home joint config `[0, 0, 0, 70, 0, 70, 0]`, the
 
 ## 4. Camera check
 
-### RealSense
+The inference script defaults to plain OpenCV `cv2.VideoCapture(int)` — same as production data collection (`collect_xarm_demos.py`). RealSense cameras also enumerate as UVC devices through this path, so you don't need pyrealsense2 unless you specifically want the SDK pipeline.
+
+### Default — OpenCV (recommended)
+
+```bash
+./.venv/bin/python -c "
+import cv2
+for i in range(8):
+    c = cv2.VideoCapture(i); ok, _ = c.read()
+    print(f'cam {i}:', 'OK' if ok else 'no signal'); c.release()
+"
+```
+
+Pick the indices that responded `OK`. Default mapping is `--agent-cam-id 0 --wrist-cam-id 2`, matching collection-time defaults. If your USB-bus enumeration differs, override on the CLI.
+
+### Opt-in — RealSense SDK
+
+If you specifically need the RealSense pipeline (different exposure / WB controls, depth streams, etc.), pass `--use-realsense`. In that mode `--agent-cam-id` and `--wrist-cam-id` must be **real D400 serial numbers**, not USB indices. Discover them with:
 
 ```bash
 ./.venv/bin/python -c "
@@ -181,24 +198,21 @@ for d in rs.context().query_devices():
 "
 ```
 
-Note the two serial numbers — they go into `--agent-cam-id` and `--wrist-cam-id`. The defaults `0` and `2` correspond to the first and third connected RealSense devices.
+Note: the model in `EdwardoSunny/pi05-xarm-finetune-lora-droid-init-20k` was trained on data captured via the OpenCV path. Using RealSense at inference is fine optically, but won't match training-time pixel statistics any closer than OpenCV does.
 
-### USB
+### Visual check (optional but recommended)
+
+Save one frame from each camera and open it — confirm the agent view shows the table from roughly the angle the training demos used:
 
 ```bash
 ./.venv/bin/python -c "
 import cv2
-for i in range(4):
-    c = cv2.VideoCapture(i); ok, _ = c.read()
-    print(f'cam {i}:', 'OK' if ok else 'no signal'); c.release()
+for src, name in [(0, 'agent'), (2, 'wrist')]:
+    c = cv2.VideoCapture(src); ok, frame = c.read(); c.release()
+    if ok: cv2.imwrite(f'/tmp/{name}.png', frame); print(f'{name} saved')
+    else:   print(f'{name} FAILED')
 "
 ```
-
-Pick the indices that responded `OK`, in the order that matches agent-view + wrist-view of your rig.
-
-### Visual check (optional but recommended)
-
-Save one frame from each camera to disk and open it; confirm the agent view shows the table from roughly the angle the training demos used.
 
 ---
 
