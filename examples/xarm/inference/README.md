@@ -1,75 +1,140 @@
-# Testing & running the xArm fine-tune
+# pi05 xArm fine-tune — testing & deployment
 
-End-to-end guide to verify a `pi05_xarm_finetune_lora` checkpoint and put it on the robot. Run the stages **in order** — each one rules out a class of failure before you risk the next.
+End-to-end guide for taking a trained `pi05_xarm_finetune_lora` checkpoint, putting it on a fresh inference machine, verifying it produces sensible outputs, and running it on the real xArm.
+
+**Run the stages in order.** Each one rules out a class of failure before you risk the next.
 
 | Stage | What it tests | Hardware needed | Risk |
 |---|---|---|---|
-| 0. Install extras | venv has xArm SDK + RealSense | none | none |
-| 1. Smoke imports | openpi + config + ckpt readable | none | none |
-| 2. Offline sanity check | model outputs sensible values | none | none |
-| 3. Robot reachability | xArm IP responds | xArm powered, on network | none |
-| 4. Camera check | cameras enumerable + framing right | cameras | none |
-| 5. Dry run | full inference loop, no servo commands | cameras (+ optional arm) | none |
-| 6. Slow live rollout | model actually drives the arm | arm + cameras | low |
-| 7. Full-speed rollout | production speed run | arm + cameras | medium |
+| [Setup](#setup) — clone, venv, deps | code is ready to run | none | none |
+| [1. Download](#1-download-the-checkpoint) the checkpoint | HF / scp / rsync working | none | none |
+| [2. Offline sanity](#2-offline-sanity-check) check | model outputs sensible values | none | none |
+| [3. Robot](#3-robot-reachability) reachability | xArm IP responds | xArm powered, on network | none |
+| [4. Cameras](#4-camera-check) | cameras enumerable + framing right | cameras | none |
+| [5. Dry run](#5-dry-run-cameras--inference-no-arm-motion) | full inference loop, no servo commands | cameras (+ optional arm) | none |
+| [6. Slow live](#6-slow-live-rollout-first-robot-test) rollout | model actually drives the arm | arm + cameras | low |
+| [7. Full-speed](#7-full-speed-rollout) rollout | production speed run | arm + cameras | medium |
 
-If any stage fails, stop and debug *before* moving to the next.
+If any stage fails, stop and debug before moving on. The first three are cheap to repeat.
 
 ---
 
-## 0. One-time install
+## Setup
 
-The openpi venv at `/data/edward/openpi/.venv` already has JAX, openpi, scipy, opencv, zarr. Add the inference-only deps:
+On the **inference machine** (the host wired to the xArm and cameras):
 
 ```bash
-/data/edward/openpi/.venv/bin/pip install -r examples/xarm/inference/requirements.txt
+# 1) clone the openpi fork that has the pi05_xarm_finetune_lora config + inference scripts
+git clone <your-fork-url> openpi
+cd openpi
+
+# 2) standard openpi install (Python 3.11)
+GIT_LFS_SKIP_SMUDGE=1 uv sync
+GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+
+# 3) inference-only extras (xArm SDK + RealSense + huggingface_hub)
+./.venv/bin/pip install -r examples/xarm/inference/requirements.txt
+./.venv/bin/pip install huggingface_hub      # only if downloading from HF
 ```
 
-Installs `xArm-Python-SDK`, `pyrealsense2`, `opencv-python` (last one is no-op if already present). Skip `pyrealsense2` if you only use USB cameras.
+The openpi `uv sync` installs JAX, scipy, opencv, zarr, etc. The line above only adds `xArm-Python-SDK`, `pyrealsense2`, and optionally `huggingface_hub`.
 
----
-
-## 1. Smoke imports
-
-Verifies the venv can load the config and locate the checkpoint:
+Verify the config + checkpoint loader can be imported:
 
 ```bash
-/data/edward/openpi/.venv/bin/python -c "
+./.venv/bin/python -c "
 from openpi.training import config as _config
 cfg = _config.get_config('pi05_xarm_finetune_lora')
 print('config:', cfg.name)
-print('loader:', cfg.weight_loader)
 print('repo:  ', cfg.data.repo_id)
 "
+# expected:
+# config: pi05_xarm_finetune_lora
+# repo:   local/xarm_teleop
 ```
 
-Expected output:
-```
-config: pi05_xarm_finetune_lora
-loader: CheckpointWeightLoader(params_path='gs://openpi-assets/checkpoints/pi05_droid/params')
-repo:   local/xarm_teleop
-```
-
-Also check the checkpoint dir exists and has both `params/` and `assets/`:
-
-```bash
-ls /data/edward/openpi/checkpoints/pi05_xarm_finetune_lora/droid_init_20k/19999/
-# expected: _CHECKPOINT_METADATA  assets  params  train_state
-```
+If this fails, the openpi clone is missing the config edits.
 
 ---
 
-## 2. Offline sanity check (most important test)
+## 1. Download the checkpoint
 
-Pulls training-distribution frames from the zarr, runs them through the policy, and checks each predicted action chunk against ground truth. **No robot, no cameras needed.**
+You need ~7 GB of weights + norm stats. Three ways to get them, in decreasing order of recommendedness:
+
+### Option A — Hugging Face Hub (recommended)
+
+```bash
+# Log in if the repo is still private. (Public repos: skip login.)
+./.venv/bin/huggingface-cli login
+
+# Pull. Defaults to fetching only the inference essentials (params + assets + metadata);
+# pass --include-train-state if you intend to resume training too.
+./.venv/bin/python examples/xarm/inference/pull_from_hub.py \
+    --repo-id EdwardoSunny/pi05-xarm-finetune-lora-droid-init-20k \
+    --local-dir ./checkpoints/pi05_xarm_finetune_lora_pulled
+```
+
+Public URL: <https://huggingface.co/EdwardoSunny/pi05-xarm-finetune-lora-droid-init-20k>
+
+### Option B — rsync from the training host
+
+If both machines can reach each other over SSH:
+
+```bash
+rsync -avP --exclude='train_state' \
+    edward@<training-host>:/data/edward/openpi/checkpoints/pi05_xarm_finetune_lora/droid_init_20k/19999/ \
+    ./checkpoints/pi05_xarm_finetune_lora_pulled/
+```
+
+The trailing slashes matter — they copy *the contents* of `19999/` into the destination.
+
+### Option C — tarball (air-gapped / USB / S3)
+
+```bash
+# on the training host
+cd /data/edward/openpi/checkpoints/pi05_xarm_finetune_lora/droid_init_20k
+tar --exclude='train_state' -czvf pi05_xarm_finetune_lora_19999.tar.gz 19999/
+
+# transfer the .tar.gz however you like, then on the inference machine:
+mkdir -p ./checkpoints/pi05_xarm_finetune_lora_pulled
+tar -xzvf pi05_xarm_finetune_lora_19999.tar.gz \
+    -C ./checkpoints/pi05_xarm_finetune_lora_pulled --strip-components=1
+```
+
+### Confirm the layout
+
+After any of the three options:
+
+```bash
+ls ./checkpoints/pi05_xarm_finetune_lora_pulled
+# expected:
+#   _CHECKPOINT_METADATA  params/  assets/    (and train_state/ if you included it)
+
+ls ./checkpoints/pi05_xarm_finetune_lora_pulled/assets/local/xarm_teleop/
+# expected:
+#   norm_stats.json
+```
+
+If either listing differs, the download was incomplete — re-run the pull.
+
+---
+
+## 2. Offline sanity check
+
+**No robot, no cameras needed.** Pulls training-distribution frames from the source zarr, runs them through the policy, and compares each predicted action chunk to the ground-truth `tcp[t+1] - tcp[t]` chunk built from the same demo.
+
+For this you also need the zarr the model was trained on. If you have it locally, point at it:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-  /data/edward/openpi/.venv/bin/python examples/xarm/inference/sanity_check.py \
-  --checkpoint /data/edward/openpi/checkpoints/pi05_xarm_finetune_lora/droid_init_20k/19999
+  ./.venv/bin/python examples/xarm/inference/sanity_check.py \
+    --checkpoint ./checkpoints/pi05_xarm_finetune_lora_pulled \
+    --zarr-path /path/to/your/teleop_data.zarr
 ```
 
-For each of 3 episodes, prints predictions for 3 phases (`approach`, `pre-grasp`, `lift`). Look for these patterns:
+(The default `--zarr-path /data/edward/teleop_data.zarr` only works on the training host.)
+
+For each of 3 episodes, you'll see predictions for 3 phases. Expected patterns:
 
 | Phase | What the predicted chunk should show |
 |---|---|
@@ -77,16 +142,18 @@ For each of 3 episodes, prints predictions for 3 phases (`approach`, `pre-grasp`
 | **pre-grasp** (state z ≈ 0.03 m) | Δz decelerating to ≈ 0, **grasp flips −1 → +1 mid-chunk** |
 | **lift** (state z ≈ 0.01 m, grasp = 1) | grasp held ≈ +1 (closed), Δz turns positive at step ~8 |
 
-Per-step abs errors should be **sub-mm in xyz** (≤ 1.5 mm), **sub-mrad in axis-angle** (≤ 0.005 rad), and **near-zero in grasp** (≤ 0.04). If errors are 10× bigger or trends are wrong, the checkpoint is bad — don't proceed.
+Per-step abs errors should be **sub-mm in xyz** (≤ 1.5 mm), **sub-mrad in axis-angle** (≤ 0.005 rad), and **near-zero in grasp** (≤ 0.04). If errors are 10× bigger or trends are wrong, the checkpoint download is corrupt or the model is bad — **stop here** and don't move on to robot tests.
+
+If you don't have the training zarr on the inference machine, skip this step and rely on the dry-run (stage 5) to verify the inference path.
 
 ---
 
-## 3. xArm reachability
+## 3. Robot reachability
 
 Connect to the arm, read its TCP pose, disconnect. Confirms IP + power + network:
 
 ```bash
-/data/edward/openpi/.venv/bin/python -c "
+./.venv/bin/python -c "
 from xarm.wrapper import XArmAPI
 arm = XArmAPI('192.168.1.223')
 arm.connect()
@@ -96,7 +163,7 @@ arm.disconnect()
 "
 ```
 
-If the arm is at the known home joint config `[0, 0, 0, 70, 0, 70, 0]`, the printed TCP pose should be ≈ `(475.79, -1.14, 244.72, 179.13, -0.01, 0.78)` (mm, deg). If the arm is somewhere else, that's fine — the live script's homing step will move it to that reference pose.
+If the arm happens to be at the home joint config `[0, 0, 0, 70, 0, 70, 0]`, the printed TCP pose should be ≈ `(475.79, -1.14, 244.72, 179.13, -0.01, 0.78)` (mm, deg). It's fine if the arm is somewhere else — the live script will home it.
 
 **Common failures**: timeout → wrong IP or arm not powered. Connect=True but pose all zeros → arm needs `motion_enable(True)`.
 
@@ -107,63 +174,47 @@ If the arm is at the known home joint config `[0, 0, 0, 70, 0, 70, 0]`, the prin
 ### RealSense
 
 ```bash
-/data/edward/openpi/.venv/bin/python -c "
+./.venv/bin/python -c "
 import pyrealsense2 as rs
 for d in rs.context().query_devices():
     print(d.get_info(rs.camera_info.name), '->', d.get_info(rs.camera_info.serial_number))
 "
 ```
 
-Note the two serial numbers — those are the values for `--agent-cam-id` and `--wrist-cam-id`. The defaults `0` and `2` correspond to the first and third connected devices (1280×720 @ 30 fps, exp=120, wb=5900K — match the collection-time settings).
+Note the two serial numbers — they go into `--agent-cam-id` and `--wrist-cam-id`. The defaults `0` and `2` correspond to the first and third connected RealSense devices.
 
 ### USB
 
 ```bash
-/data/edward/openpi/.venv/bin/python -c "
+./.venv/bin/python -c "
 import cv2
 for i in range(4):
-    c = cv2.VideoCapture(i)
-    ok, _ = c.read()
-    print(f'cam {i}:', 'OK' if ok else 'no signal')
-    c.release()
+    c = cv2.VideoCapture(i); ok, _ = c.read()
+    print(f'cam {i}:', 'OK' if ok else 'no signal'); c.release()
 "
 ```
 
 Pick the indices that responded `OK`, in the order that matches agent-view + wrist-view of your rig.
 
-### Visual check (optional)
+### Visual check (optional but recommended)
 
-Capture and save one frame from each:
-
-```bash
-/data/edward/openpi/.venv/bin/python -c "
-import cv2, pyrealsense2 as rs
-for serial, name in (('AGENT_SERIAL', 'agent'), ('WRIST_SERIAL', 'wrist')):
-    p = rs.pipeline()
-    c = rs.config(); c.enable_device(serial); c.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
-    p.start(c)
-    for _ in range(30): p.wait_for_frames()
-    img = np.asanyarray(p.wait_for_frames().get_color_frame().get_data())
-    cv2.imwrite(f'/tmp/{name}.png', img); p.stop()
-"
-```
-
-Open `/tmp/agent.png` and `/tmp/wrist.png` and confirm the agent view shows the table from where the policy expects to see it.
+Save one frame from each camera to disk and open it; confirm the agent view shows the table from roughly the angle the training demos used.
 
 ---
 
-## 5. Dry run
+## 5. Dry run (cameras + inference, no arm motion)
 
-Full inference loop with cameras and video recording, **but no servo commands to the arm**. This catches camera framing, image-preprocessing, and inference issues without any robot risk:
+Full inference loop with cameras and video recording, **but no servo commands**. This catches camera framing, image preprocessing, and inference issues without any robot risk:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-  /data/edward/openpi/.venv/bin/python examples/xarm/inference/run_xarm_inference.py \
-  --checkpoint /data/edward/openpi/checkpoints/pi05_xarm_finetune_lora/droid_init_20k/19999 \
-  --dry-run --max-steps 30
+  ./.venv/bin/python examples/xarm/inference/run_xarm_inference.py \
+    --checkpoint ./checkpoints/pi05_xarm_finetune_lora_pulled \
+    --dry-run --max-steps 30
 ```
 
-Expected log lines:
+Expected log:
+
 ```
 … Policy loaded.
 … RealSense initialized (agent=0, wrist=2, 1280x720@30, exp=120, wb=5900K)
@@ -172,53 +223,60 @@ Expected log lines:
 …
 ```
 
-Then watch the saved `.mp4` to confirm the camera views look like what the policy trained on.
+After it finishes, open the saved `.mp4` (side-by-side agent + wrist) and confirm the camera views look like what the policy trained on. If the views look very different (different table, different angle, different lighting), expect the live rollout to behave poorly — fix the camera setup, not the model.
 
 ---
 
 ## 6. Slow live rollout (first robot test)
 
-`--action-scale 0.5` halves the magnitude of every commanded delta; `--max-action-norm 0.03` clips any single-step Cartesian motion over 3 cm. `--max-steps 50` caps the rollout at ≈ 5 seconds:
+The first time you run on the real arm, use conservative safety flags:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-  /data/edward/openpi/.venv/bin/python examples/xarm/inference/run_xarm_inference.py \
-  --checkpoint /data/edward/openpi/checkpoints/pi05_xarm_finetune_lora/droid_init_20k/19999 \
-  --xarm-ip 192.168.1.223 \
-  --action-scale 0.5 \
-  --max-action-norm 0.03 \
-  --max-steps 50
+  ./.venv/bin/python examples/xarm/inference/run_xarm_inference.py \
+    --checkpoint ./checkpoints/pi05_xarm_finetune_lora_pulled \
+    --xarm-ip 192.168.1.223 \
+    --action-scale 0.5 \
+    --max-action-norm 0.03 \
+    --max-steps 50
 ```
 
+Flag meanings:
+- `--action-scale 0.5` — half-magnitude every commanded delta
+- `--max-action-norm 0.03` — clip any single-step 6-D motion above 3 cm
+- `--max-steps 50` — cap rollout at 5 seconds (50 × 0.1 s at 10 Hz)
+
 What happens:
-1. Arm switches to position mode, opens the gripper, moves to `[0, 0, 0, 70, 0, 70, 0]` (joint angles).
-2. Script logs the reached TCP pose — should be `(475.79, -1.14, 244.72, 179.13, -0.01, 0.78)` ± a few mm.
+1. Arm switches to position mode, opens the gripper, homes to joint angles `[0, 0, 0, 70, 0, 70, 0]`.
+2. Script logs the reached TCP pose — should be ≈ `(475.79, -1.14, 244.72, 179.13, -0.01, 0.78)` ± a few mm. If it's wildly off, the arm's URDF / calibration differs from the lab rig; review before pressing ENTER.
 3. Script prints `Press ENTER to begin rollout…` — **keep one hand on Ctrl+C, then press ENTER**.
 4. Robot executes 50 commanded deltas at 10 Hz, then returns to home and disconnects.
 
-Watch for: smooth motion toward the block, gripper closes when the EE is over the object, lift after close. Sub-mm tracking errors are normal; centimeter-scale deviation from the demo trajectory is fine on a slow run.
+Watch for: smooth descent toward the block, gripper closes when the EE is over the object, lift after close. Sub-mm tracking errors are normal; centimeter-scale deviation from the demo trajectory is fine on a slow run.
 
-If anything looks unsafe — Ctrl+C immediately. The script catches SIGINT, triggers `arm.set_state(4)` (emergency stop), homes, and exits cleanly.
+If anything looks unsafe, Ctrl+C. The script catches SIGINT, triggers `arm.set_state(4)` (emergency stop), homes, and exits.
 
 ---
 
 ## 7. Full-speed rollout
 
-Once the slow run looks safe, drop back to defaults:
+Once the slow run looks safe, drop the safety flags back to defaults:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-  /data/edward/openpi/.venv/bin/python examples/xarm/inference/run_xarm_inference.py \
-  --checkpoint /data/edward/openpi/checkpoints/pi05_xarm_finetune_lora/droid_init_20k/19999 \
-  --xarm-ip 192.168.1.223 \
-  --max-steps 200
+  ./.venv/bin/python examples/xarm/inference/run_xarm_inference.py \
+    --checkpoint ./checkpoints/pi05_xarm_finetune_lora_pulled \
+    --xarm-ip 192.168.1.223 \
+    --max-steps 200
 ```
 
-Defaults: `--action-scale 1.0`, `--max-action-norm 0.05`, 200 steps (≈ 20 s of execution at 10 Hz). Re-records the rollout video and homes the arm at the end.
+Defaults: `--action-scale 1.0`, `--max-action-norm 0.05`, 200 steps (~20 s of execution at 10 Hz). Re-records the rollout video and homes the arm at the end.
 
 ---
 
-## CLI reference
+# Reference
+
+## CLI reference (`run_xarm_inference.py`)
 
 ```
 --checkpoint PATH              # required, path to step-N checkpoint dir
@@ -234,12 +292,37 @@ Defaults: `--action-scale 1.0`, `--max-action-norm 0.05`, 200 steps (≈ 20 s of
 --action-scale F               # default: 1.0  (scale on the 6-D pose delta)
 --max-action-norm F            # default: 0.05  (clip per-step 6-D delta norm, meters)
 --auto-start                   # skip the manual ENTER prompt
---dry-run                      # full loop, but don't send servo commands to the arm
+--dry-run                      # full loop, but don't send servo commands
 --no-video                     # skip video recording
 --video-path PATH              # default: rollouts/xarm_inference_<timestamp>.mp4
 ```
 
----
+## CLI reference (`sanity_check.py`)
+
+```
+--checkpoint PATH              # required, path to step-N checkpoint dir
+--train-config-name NAME       # default: pi05_xarm_finetune_lora
+--zarr-path PATH               # default: /data/edward/teleop_data.zarr
+--prompt TEXT                  # default: "pick up the red block"
+--n-episodes N                 # default: 3
+--horizon N                    # default: 10
+```
+
+## CLI reference (`pull_from_hub.py` / `push_to_hub.py`)
+
+```
+# pull
+--repo-id REPO_ID              # required, e.g. EdwardoSunny/pi05-xarm-finetune-lora-droid-init-20k
+--local-dir PATH               # required, where to download into
+--include-train-state          # also fetch train_state/ (~2 GB), only for resuming training
+
+# push  (run on the training host)
+--checkpoint PATH              # required, local checkpoint directory
+--repo-id REPO_ID              # required
+--private                      # make repo private (default: public)
+--exclude-train-state          # skip train_state/ (saves ~2 GB)
+--commit-message TEXT          # default: "upload xarm fine-tune checkpoint"
+```
 
 ## Conventions reference
 
@@ -260,7 +343,7 @@ These are baked into the converter, the training data, and this script. **Don't 
 
 Joint-space, via `arm.set_servo_angle([0, 0, 0, 70, 0, 70, 0], speed=50, wait=True)`, matching `ril_env.xarm_controller.XArmConfig.home_pos`. Maps to TCP ≈ `(475.79 mm, -1.14 mm, 244.72 mm, 179.13°, -0.01°, 0.78°)` on the lab xArm 7.
 
-Why joint-space, not Cartesian: same joint angles always produce the same arm configuration — no IK ambiguity, no risk of hitting a singularity on the way home.
+Joint-space homing is more robust than Cartesian (`set_position`) because there's no IK ambiguity — same joint angles always produce the same arm configuration.
 
 ## Why we don't go through `ril_env.XArm.step()`
 
@@ -270,9 +353,23 @@ If you want to route through the ril_env wrapper anyway, pre-divide the 6-D delt
 
 ## Tactile arrow overlay
 
-The `apply_tactile_overlay(img, tactile_reading)` hook in the inference script currently returns the image unchanged. The dataset we trained on had `n_contacts` all-zero, so no arrows were drawn at training time — the policy effectively learned on plain camera frames. Identity at inference is correct for **this** checkpoint.
+`apply_tactile_overlay(img, tactile_reading)` is a stub that currently returns the image unchanged. The dataset we trained on had `n_contacts` all-zero, so no arrows were drawn at training time — the policy effectively learned on plain camera frames, and identity at inference is correct for **this** checkpoint.
 
 For future retraining on data with real tactile contacts, fill this hook in with the same renderer used at collection. Otherwise the deployment pixel distribution diverges from training and the policy will fall out of distribution.
+
+## What gets transferred (and what doesn't)
+
+| Piece | Where it lives | Needed at inference? |
+|---|---|---|
+| `params/` (orbax shards, ~7 GB) | inside the checkpoint dir | **yes** — the model weights |
+| `assets/local/xarm_teleop/norm_stats.json` | inside the checkpoint dir | **yes** — input/output normalization |
+| `_CHECKPOINT_METADATA` | inside the checkpoint dir | yes |
+| `train_state/` (~2 GB) | inside the checkpoint dir | **no** — only for resuming training |
+| The xArm zarr | `/data/edward/teleop_data.zarr` (training host) | only for `sanity_check.py`, not for live rollout |
+| The LeRobot dataset | `~/.cache/huggingface/lerobot/local/xarm_teleop` | no — irrelevant at inference |
+| Base `pi05_droid` checkpoint | `gs://openpi-assets/checkpoints/pi05_droid/` | **no** — fully baked into our LoRA weights |
+
+So the minimal package to ship is `params/` + `assets/` + `_CHECKPOINT_METADATA` (≈ 7 GB) plus the openpi repo with our config + inference scripts. Everything else stays on the training host.
 
 ## Troubleshooting
 
@@ -280,10 +377,10 @@ For future retraining on data with real tactile contacts, fill this hook in with
 → `pip install xArm-Python-SDK` into the openpi venv. The PyPI package name has a hyphen and capital A; the import module is lowercase `xarm`.
 
 **`policy.infer` returns NaN actions**
-→ Norm stats are stale or wrong. Re-run `compute_norm_stats.py --config-name pi05_xarm_finetune_lora` and confirm a fresh `norm_stats.json` appears under `assets/pi05_xarm_finetune_lora/local/xarm_teleop/`.
+→ Norm stats are stale or wrong. Confirm the checkpoint has `assets/local/xarm_teleop/norm_stats.json` and that it matches what came out of training. If you don't have access to the original norm stats, recompute them with `compute_norm_stats.py --config-name pi05_xarm_finetune_lora` *but only against the same training zarr* — they must come from the data the model was trained on.
 
 **Robot moves the wrong direction in one axis**
-→ Almost certainly an Euler-convention mismatch. The converter and inference script both use scipy `from_euler("xyz", …, degrees=True)` — if your xArm firmware reports `zyx` or similar, *both* would have to be flipped together. Test on the bench with very small motions before doing a real task.
+→ Almost certainly an Euler-convention mismatch. The converter and inference script both use scipy `from_euler("xyz", …, degrees=True)`. If your xArm firmware reports `zyx` or similar, *both* would have to be flipped together. Test on the bench with very small motions before doing a real task.
 
 **Servo command returns non-zero code mid-rollout**
 → Usually means the target exceeded a joint limit or collision threshold. Lower `--action-scale` or `--max-action-norm`. If it happens at step 0, the model's first prediction is OOD — check the home pose matches your training-time start poses.
@@ -291,8 +388,11 @@ For future retraining on data with real tactile contacts, fill this hook in with
 **Gripper opens when it should close (or vice versa)**
 → The conversion is `+1 = closed → set_gripper_position(0)`. If your gripper is wired inverted (some custom grippers), flip the threshold in `XArmController.execute_delta`.
 
-**Policy outputs look reasonable in sanity_check.py but the arm sits still on the live rollout**
-→ Known "noop attractor" mode where the model predicts near-zero deltas when the start scene looks too quiescent. Mitigations: re-collect data with leading paused frames trimmed harder (already enabled in the converter via `_count_leading_paused`), or temporarily inject a small fixed descent for the first few steps. The vla-finetune repo's `--warmup_steps` flag is the precedent.
+**Policy outputs look reasonable in `sanity_check.py` but the arm sits still on the live rollout**
+→ Known "noop attractor" mode — the model predicts near-zero deltas when the start scene looks too quiescent. Mitigations: re-collect data with leading paused frames trimmed harder (already enabled in the converter via `_count_leading_paused`), or temporarily inject a small fixed descent for the first few steps. The vla-finetune repo's `--warmup_steps` flag is the precedent.
 
 **Out of GPU memory during policy load**
-→ The pi0.5 LoRA model needs ~12 GB. If GPU 0 is occupied, switch with `CUDA_VISIBLE_DEVICES=N`. The model also respects `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` (drops to 0.7 if a workspace conflict appears).
+→ The pi0.5 LoRA model needs ~12 GB. If GPU 0 is occupied, switch with `CUDA_VISIBLE_DEVICES=N`. The model also respects `XLA_PYTHON_CLIENT_MEM_FRACTION` (drop from 0.9 to 0.7 if a workspace conflict appears).
+
+**Pull from HF asks for credentials**
+→ The repo is still private. Either run `huggingface-cli login`, or flip the repo to public in the HF web UI (`Settings → Change visibility`).
