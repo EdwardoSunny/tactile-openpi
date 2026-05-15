@@ -37,6 +37,23 @@ Safety:
     - --dry-run runs the full inference loop with no robot servo commands.
     - The first servo command is blocked behind a manual ENTER prompt unless --auto-start.
 
+Tactile gripper safety (mandatory):
+    Two A31301 ESP32 boards (one per finger) stream a 3x3 Hall grid each over USB
+    serial. We mirror the gripper-safety wrapper from
+    /data/edward/tactile-data-collection (XArm._apply_tactile_safety): every control
+    tick, evaluate the per-cell delta-from-idle metric (default sum_abs_z over the
+    18 connected taxels); if it exceeds --safety-threshold OR the readings are stale,
+    a CLOSING command is clamped to the previous grasp value — the gripper freezes
+    in place. Opening is always allowed. This is the same logic the data was
+    collected under, so the deployment-time behavior matches training.
+
+    Tactile is REQUIRED. If both boards aren't streaming live data within
+    --tactile-init-timeout seconds, the script hard-fails before homing the
+    robot. The continuous-grasp mapping (action[6] in [-1,+1] -> gripper
+    position in [850,0]) replaces the previous binary 0/850 step so the
+    safety clamp actually corresponds to a physical "stop here" rather than
+    "next tick try to slam to 0 again".
+
 The tactile arrow overlay (drawn on training-time `img_0`/`img_1`) is left as a stub
 hook in `apply_tactile_overlay`. The teleop_data.zarr we trained on had `n_contacts`
 all-zero, so the trained model never saw arrows — running with the hook as identity is
@@ -50,6 +67,7 @@ import argparse
 import collections
 import dataclasses
 import logging
+import os
 from pathlib import Path
 import signal
 import sys
@@ -61,9 +79,17 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 
+# Allow `tactile_safety` (sibling file in this directory) to be importable when
+# the script is run as `python examples/xarm/inference/run_xarm_inference.py ...`
+# rather than as a package. Has to happen before the `from tactile_safety` import.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
 # openpi imports (must be importable; the .venv created by `uv sync` has them).
 from openpi.policies import policy_config
 from openpi.training import config as _config
+from tactile_safety import TactileConfig, TactileSensors
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
@@ -126,6 +152,19 @@ class XArmInferenceConfig:
     max_action_norm: float = 0.05  # 5 cm Cartesian per step (rad+m mixed but xArm tolerances reasonable)
     auto_start: bool = False
     dry_run: bool = False
+
+    # Tactile safety (REQUIRED — script hard-fails if these aren't streaming).
+    # Defaults mirror tactile-data-collection/tactile_config.py: two A31301 boards
+    # on /dev/ttyACM{0,1}, sum_abs_z metric in delta-from-idle mode with a
+    # threshold of 1500 (idle-noise band ~50 counts; firm grip ~1500-2000).
+    left_port: str = "/dev/ttyACM0"
+    right_port: str = "/dev/ttyACM1"
+    tactile_baud: int = 115200
+    safety_metric: str = "sum_abs_z"
+    safety_threshold: float = 1500.0
+    stale_after_sec: float = 0.2
+    baseline_duration_sec: float = 1.5    # how long to sample at-rest before the rollout
+    tactile_init_timeout_sec: float = 5.0  # how long to wait for both boards to publish
 
     # Video
     save_video: bool = True
@@ -380,10 +419,22 @@ class CameraManager:
 
 
 class XArmController:
-    def __init__(self, cfg: XArmInferenceConfig) -> None:
+    # Gripper bounds in xArm SDK units. grasp=0.0 -> open_pos, grasp=1.0 -> close_pos.
+    # Matches XArmConfig defaults in tactile-data-collection/environment/xarm_controller.py
+    # so the safety threshold (calibrated against that gripper speed) holds.
+    GRIPPER_OPEN_POS = 850
+    GRIPPER_CLOSE_POS = 0
+    GRIPPER_SPEED = 1000           # set once at init; same speed used during teleop collection
+    GRIPPER_EPS = 0.01             # min |Δgrasp| in [0,1] before re-issuing a gripper command
+
+    def __init__(self, cfg: XArmInferenceConfig, tactile: TactileSensors) -> None:
         from xarm.wrapper import XArmAPI  # local import; only needed when not in dry_run
 
         self.cfg = cfg
+        self.tactile = tactile           # required, never None on the real-robot path
+        self.previous_grasp = 0.0        # last grasp we commanded, in [0,1]; 0 = open
+        self._safety_active = False     # one-shot warning latch so the log isn't spammed
+
         self.arm = XArmAPI(cfg.xarm_ip)
         self.arm.connect()
         self.arm.clean_error()
@@ -395,11 +446,29 @@ class XArmController:
         self.arm.set_mode(1)
         self.arm.set_state(0)
         self.arm.set_collision_sensitivity(3)
-        log.info("xArm connected at %s", cfg.xarm_ip)
+        # Gripper init — matches tactile-data-collection so continuous position
+        # commands (set_gripper_position with target in [0, 850]) actually track.
+        # Without set_gripper_enable(True) some firmware versions silently ignore
+        # set_gripper_position. Speed is set once and persists across calls.
+        code = self.arm.set_gripper_mode(0)
+        if code != 0:
+            raise RuntimeError(f"set_gripper_mode failed: code {code}")
+        code = self.arm.set_gripper_enable(True)
+        if code != 0:
+            raise RuntimeError(f"set_gripper_enable failed: code {code}")
+        code = self.arm.set_gripper_speed(self.GRIPPER_SPEED)
+        if code != 0:
+            raise RuntimeError(f"set_gripper_speed failed: code {code}")
+        log.info("xArm connected at %s (tactile safety wired)", cfg.xarm_ip)
 
     def home(self) -> None:
         """Joint-space homing — same routine as ril_env.xarm_controller.XArm.home():
         position-mode → open gripper → set_servo_angle(home_joint_angles) → servo-mode.
+
+        Also resets previous_grasp = 0.0 and clears the safety latch, mirroring
+        XArm.home() in tactile-data-collection — without this, the gripper-eps
+        gate in _apply_grasp would silently swallow the first command after a
+        home since previous_grasp would still hold its last pre-home value.
         """
         log.info("Homing via set_servo_angle(angle=%s, speed=%g)",
                  list(self.cfg.home_joint_angles_deg), self.cfg.home_speed)
@@ -407,7 +476,7 @@ class XArmController:
         self.arm.set_mode(0)
         self.arm.set_state(0)
         # Open the gripper first so the first observed grasp state is OPEN (matches training start).
-        self.arm.set_gripper_position(850, wait=True, speed=5000)
+        self.arm.set_gripper_position(self.GRIPPER_OPEN_POS, wait=True)
         code = self.arm.set_servo_angle(
             angle=list(self.cfg.home_joint_angles_deg),
             speed=self.cfg.home_speed,
@@ -418,6 +487,9 @@ class XArmController:
         # Back to streaming servo mode for the rollout.
         self.arm.set_mode(1)
         self.arm.set_state(0)
+        # Gripper is now open after homing; sync our cached state.
+        self.previous_grasp = 0.0
+        self._safety_active = False
         # Log the resulting TCP pose so the user can sanity-check against the
         # reference (~ 475.79, -1.14, 244.72, 179.13, -0.01, 0.78).
         code, pose = self.arm.get_position()
@@ -453,6 +525,11 @@ class XArmController:
         We compose the delta onto the *current measured* pose (not the previous target),
         which matches what the model was trained to predict (`tcp[t+1] - tcp[t]` in
         measured-EE-pose space; see `examples/xarm/convert_zarr_to_lerobot.py`).
+
+        Gripper command is routed through the tactile safety wrapper: if the metric
+        is over threshold (or readings are stale) and the model is asking to close
+        further than `previous_grasp`, the grasp is clamped to `previous_grasp`.
+        Opening is always allowed.
         """
         cur_state = self.get_state_8dim()
         cur_xyz_m = cur_state[:3]
@@ -482,12 +559,61 @@ class XArmController:
         if code != 0:
             log.warning("set_servo_cartesian returned code %d (target=%s)", code, target_pose_mm_deg)
 
-        # Gripper: model emits action[6] in {-1=open, +1=closed} (training convention from
-        # converter: grasp_pm1 = 2*phone_raw - 1, phone_raw ∈ {0=open, 1=closed}).
-        # Threshold to a discrete xArm position to avoid chatter.
-        grasp = float(action[6])
-        target_grip = 0 if grasp > 0.0 else 850   # closed if model says +, open if -
-        self.arm.set_gripper_position(target_grip, wait=False, speed=5000)
+        # Gripper. The model emits action[6] in {-1=open, +1=closed} (training convention from
+        # `examples/xarm/convert_zarr_to_lerobot.py`: grasp_pm1 = 2*phone_raw - 1 with
+        # phone_raw ∈ {0=open, 1=closed}). Invert that back to the [0,1] grasp axis used
+        # by tactile-data-collection's XArm.step_abs, then route through:
+        #   - _apply_tactile_safety:  clamps to previous_grasp when closing into contact
+        #   - _apply_grasp_continuous: eps-gated set_gripper_position with continuous target
+        grasp = float(np.clip((action[6] + 1.0) * 0.5, 0.0, 1.0))
+        grasp = self._apply_tactile_safety(grasp)
+        self.previous_grasp = self._apply_grasp_continuous(grasp)
+
+    def _apply_tactile_safety(self, grasp: float) -> float:
+        """Clamp a CLOSING command to previous_grasp when tactile says unsafe.
+
+        Mirrors XArm._apply_tactile_safety in tactile-data-collection. Stale or
+        zero-connected-taxel readings count as unsafe (fail-safe). Opening
+        (grasp <= previous_grasp) is always allowed regardless of contact.
+        """
+        try:
+            metric_val, is_safe = self.tactile.safety()
+        except Exception as e:
+            log.error("[tactile] safety read failed: %s — treating as unsafe", e)
+            metric_val, is_safe = float("nan"), False
+
+        closing = grasp > self.previous_grasp
+        if not is_safe and closing:
+            if not self._safety_active:
+                log.warning(
+                    "[tactile] safety engaged (metric=%.2f, threshold=%.2f); "
+                    "holding grasp at %.3f", metric_val,
+                    self.tactile.config.safety_threshold, self.previous_grasp,
+                )
+            self._safety_active = True
+            return self.previous_grasp
+        if self._safety_active and is_safe:
+            log.info("[tactile] safety released (metric=%.2f)", metric_val)
+        self._safety_active = False
+        return grasp
+
+    def _apply_grasp_continuous(self, grasp: float) -> float:
+        """Map grasp in [0,1] to an xArm gripper position and command it.
+
+        Eps-gated so tiny numerical drift doesn't spam the gripper SDK every tick.
+        Returns the new previous_grasp value (unchanged if below epsilon).
+        """
+        grasp = float(np.clip(grasp, 0.0, 1.0))
+        if abs(grasp - self.previous_grasp) < self.GRIPPER_EPS:
+            return self.previous_grasp
+        target = int(round(
+            self.GRIPPER_OPEN_POS + grasp * (self.GRIPPER_CLOSE_POS - self.GRIPPER_OPEN_POS)
+        ))
+        code = self.arm.set_gripper_position(target, wait=False)
+        if code != 0:
+            log.warning("set_gripper_position(%d) returned code %d", target, code)
+            return self.previous_grasp
+        return grasp
 
     def emergency_stop(self) -> None:
         log.warning("EMERGENCY STOP")
@@ -526,6 +652,82 @@ class VideoRecorder:
         log.info("Saved %s", self.path)
 
 
+# ───────── tactile init + baseline ─────────
+
+
+def _build_tactile(cfg: XArmInferenceConfig) -> TactileSensors:
+    """Open both A31301 boards and wait until they're streaming live data.
+
+    Hard-fails on any of: port-open failure, no frames within
+    tactile_init_timeout_sec, or zero connected taxels on either board. The
+    intent is to never start the rollout with a dead safety wrapper — matches
+    the user spec that tactile is mandatory.
+    """
+    tcfg = TactileConfig(
+        ports=[cfg.left_port, cfg.right_port],
+        baud=cfg.tactile_baud,
+        safety_metric=cfg.safety_metric,
+        safety_threshold=cfg.safety_threshold,
+        stale_after_sec=cfg.stale_after_sec,
+    )
+    log.info("Opening tactile sensors: L=%s, R=%s @ %d baud (metric=%s, thresh=%.1f, delta-from-idle)",
+             cfg.left_port, cfg.right_port, cfg.tactile_baud,
+             cfg.safety_metric, cfg.safety_threshold)
+    tactile = TactileSensors(tcfg, names=["L", "R"])
+    tactile.__enter__()
+    if not tactile.all_open:
+        tactile.__exit__(None, None, None)
+        raise SystemExit(
+            f"[tactile] required ports failed to open: {tactile.failed_ports}. "
+            f"Check `ls /dev/ttyACM*`, board power, and udev permissions "
+            f"(dialout group). Run with the boards connected — this script "
+            f"has no --no-tactile escape hatch by design."
+        )
+    if not tactile.wait_until_fresh(timeout_sec=cfg.tactile_init_timeout_sec):
+        tactile.__exit__(None, None, None)
+        raise SystemExit(
+            f"[tactile] ports opened but neither board published a fresh frame "
+            f"within {cfg.tactile_init_timeout_sec:.1f}s. Likely the ESP32 isn't "
+            f"streaming — try power-cycling the boards or check the firmware."
+        )
+    log.info("Tactile sensors streaming (both boards fresh).")
+    return tactile
+
+
+def _capture_tactile_baseline(tactile: TactileSensors, duration_sec: float) -> np.ndarray:
+    """Average per-cell xyz over `duration_sec` while the gripper is open + no contact.
+
+    Caller must guarantee the open + no-contact condition (i.e. call this
+    immediately after homing). Returns (n_sensors, n_taxels, 3) float32.
+    Raises if no usable samples arrive — better to fail loudly than to run
+    with a zero baseline (which would put the safety threshold into raw-value
+    units, where 1500 trips constantly).
+    """
+    log.info("Sampling tactile baseline (%.1f s, keep fingers untouched)...", duration_sec)
+    samples = []
+    t_end = time.time() + duration_sec
+    while time.time() < t_end:
+        states = tactile.get_latest()
+        if all(s.get("host_timestamp", 0.0) > 0 for s in states):
+            xyz = np.stack(
+                [np.asarray(s["xyz"], dtype=np.float32) for s in states], axis=0
+            )
+            samples.append(xyz)
+        time.sleep(0.05)
+    if not samples:
+        raise SystemExit(
+            "[tactile] no usable baseline samples — boards opened but stopped "
+            "streaming during baseline capture."
+        )
+    baseline = np.mean(np.stack(samples), axis=0).astype(np.float32)
+    # Report sum_abs_z at idle so the user can sanity-check it's well under threshold.
+    sum_abs_z = float(np.sum(np.abs(baseline[..., 2])))
+    log.info("Baseline captured from %d frames. Idle sum|Bz| (raw) = %.1f; "
+             "delta-from-idle will be measured against threshold %.1f.",
+             len(samples), sum_abs_z, tactile.config.safety_threshold)
+    return baseline
+
+
 # ───────── main loop ─────────
 
 
@@ -538,85 +740,110 @@ def run(cfg: XArmInferenceConfig) -> None:
              cfg.control_hz, cfg.replan_steps)
     log.info("=" * 70)
 
-    log.info("Loading policy via openpi…")
-    train_cfg = _config.get_config(cfg.train_config_name)
-    policy = policy_config.create_trained_policy(train_cfg, str(cfg.checkpoint), default_prompt=cfg.prompt)
-    log.info("Policy loaded.")
+    # Tactile is mandatory — open and validate BEFORE anything else so that a
+    # missing sensor fails fast (before we've loaded the model or moved the arm).
+    tactile = _build_tactile(cfg)
+    # Track resources allocated *after* tactile so the outer finally can release
+    # them in the right order (cams + robot first so safety reads stay live while
+    # the robot is being homed during close, then tactile last).
+    cams: CameraManager | None = None
+    robot: XArmController | None = None
+    video: VideoRecorder | None = None
+    try:
+        log.info("Loading policy via openpi…")
+        train_cfg = _config.get_config(cfg.train_config_name)
+        policy = policy_config.create_trained_policy(
+            train_cfg, str(cfg.checkpoint), default_prompt=cfg.prompt
+        )
+        log.info("Policy loaded.")
 
-    cams = CameraManager(cfg)
-    robot = None if cfg.dry_run else XArmController(cfg)
-    video = VideoRecorder(cfg.video_path, cfg.control_hz, (cfg.image_size * 2, cfg.image_size)) if cfg.save_video else None
+        cams = CameraManager(cfg)
+        robot = None if cfg.dry_run else XArmController(cfg, tactile=tactile)
+        video = (
+            VideoRecorder(cfg.video_path, cfg.control_hz, (cfg.image_size * 2, cfg.image_size))
+            if cfg.save_video else None
+        )
 
-    if robot is not None:
-        robot.home()
-        if not cfg.auto_start:
+        if robot is not None:
+            robot.home()
+        # Capture baseline AFTER homing: at this point the gripper is open and the
+        # fingers should be untouched, so the per-cell xyz is the static field.
+        # Install on tactile.config so the safety wrapper measures delta-from-idle
+        # against cfg.safety_threshold (which is in delta units; see tactile_safety.py).
+        baseline = _capture_tactile_baseline(tactile, cfg.baseline_duration_sec)
+        tactile.config.baseline = baseline
+        if robot is not None and not cfg.auto_start:
             input("Press ENTER to begin rollout (Ctrl+C to abort)…")
 
-    # Install signal handler so Ctrl+C triggers a clean estop.
-    def _sigint(*_):
-        log.warning("SIGINT received")
-        if robot is not None:
-            robot.emergency_stop()
-        raise KeyboardInterrupt
-    signal.signal(signal.SIGINT, _sigint)
-
-    action_plan: collections.deque = collections.deque()
-    dt = 1.0 / cfg.control_hz
-
-    try:
-        for step in range(cfg.max_steps):
-            t0 = time.time()
-            agent_rgb, wrist_rgb = cams.get_observation()
-
-            if not action_plan:
-                if robot is not None:
-                    state = robot.get_state_8dim()
-                else:
-                    # Dry-run: synthesize a plausible state at the documented home TCP pose
-                    # (the values observed after homing on the lab xArm 7 — see
-                    # `home_joint_angles_deg` docstring). Gripper assumed open.
-                    home_tcp_mm_deg = (475.79, -1.14, 244.72, 179.13, -0.01, 0.78)
-                    home_xyz = np.array(home_tcp_mm_deg[:3], dtype=np.float32) / 1000.0
-                    home_aa = Rot.from_euler("xyz", home_tcp_mm_deg[3:], degrees=True).as_rotvec().astype(np.float32)
-                    state = np.concatenate([home_xyz, home_aa, [0.0, 0.0]]).astype(np.float32)
-                obs = {
-                    "observation/image": agent_rgb,
-                    "observation/wrist_image": wrist_rgb,
-                    "observation/state": state,
-                    "prompt": cfg.prompt,
-                }
-                chunk = np.asarray(policy.infer(obs)["actions"])  # (10, 7)
-                if chunk.shape[0] < cfg.replan_steps:
-                    raise RuntimeError(f"Action chunk too short: {chunk.shape}")
-                action_plan.extend(chunk[: cfg.replan_steps])
-
-            action = action_plan.popleft()
-            log.info("step=%3d  dxyz=[%+0.4f %+0.4f %+0.4f] m  daa=[%+0.4f %+0.4f %+0.4f] rad  grasp=%+0.2f",
-                     step, action[0], action[1], action[2], action[3], action[4], action[5], action[6])
-
+        # Install signal handler so Ctrl+C triggers a clean estop.
+        def _sigint(*_):
+            log.warning("SIGINT received")
             if robot is not None:
-                robot.execute_delta(action)
-            if video is not None:
-                video.write(agent_rgb, wrist_rgb)
+                robot.emergency_stop()
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGINT, _sigint)
 
-            elapsed = time.time() - t0
-            if elapsed < dt:
-                time.sleep(dt - elapsed)
+        action_plan: collections.deque = collections.deque()
+        dt = 1.0 / cfg.control_hz
 
-        log.info("Reached max_steps=%d", cfg.max_steps)
+        try:
+            for step in range(cfg.max_steps):
+                t0 = time.time()
+                agent_rgb, wrist_rgb = cams.get_observation()
 
-    except KeyboardInterrupt:
-        log.warning("Aborted by user.")
-    except Exception as e:
-        log.error("Rollout failed: %s", e, exc_info=True)
-        if robot is not None:
-            robot.emergency_stop()
+                if not action_plan:
+                    if robot is not None:
+                        state = robot.get_state_8dim()
+                    else:
+                        # Dry-run: synthesize a plausible state at the documented home TCP pose
+                        # (the values observed after homing on the lab xArm 7 — see
+                        # `home_joint_angles_deg` docstring). Gripper assumed open.
+                        home_tcp_mm_deg = (475.79, -1.14, 244.72, 179.13, -0.01, 0.78)
+                        home_xyz = np.array(home_tcp_mm_deg[:3], dtype=np.float32) / 1000.0
+                        home_aa = Rot.from_euler("xyz", home_tcp_mm_deg[3:], degrees=True).as_rotvec().astype(np.float32)
+                        state = np.concatenate([home_xyz, home_aa, [0.0, 0.0]]).astype(np.float32)
+                    obs = {
+                        "observation/image": agent_rgb,
+                        "observation/wrist_image": wrist_rgb,
+                        "observation/state": state,
+                        "prompt": cfg.prompt,
+                    }
+                    chunk = np.asarray(policy.infer(obs)["actions"])  # (10, 7)
+                    if chunk.shape[0] < cfg.replan_steps:
+                        raise RuntimeError(f"Action chunk too short: {chunk.shape}")
+                    action_plan.extend(chunk[: cfg.replan_steps])
+
+                action = action_plan.popleft()
+                log.info("step=%3d  dxyz=[%+0.4f %+0.4f %+0.4f] m  daa=[%+0.4f %+0.4f %+0.4f] rad  grasp=%+0.2f",
+                         step, action[0], action[1], action[2], action[3], action[4], action[5], action[6])
+
+                if robot is not None:
+                    robot.execute_delta(action)
+                if video is not None:
+                    video.write(agent_rgb, wrist_rgb)
+
+                elapsed = time.time() - t0
+                if elapsed < dt:
+                    time.sleep(dt - elapsed)
+
+            log.info("Reached max_steps=%d", cfg.max_steps)
+
+        except KeyboardInterrupt:
+            log.warning("Aborted by user.")
+        except Exception as e:
+            log.error("Rollout failed: %s", e, exc_info=True)
+            if robot is not None:
+                robot.emergency_stop()
     finally:
         if video is not None:
             video.close()
-        cams.close()
+        if cams is not None:
+            cams.close()
         if robot is not None:
             robot.close()
+        # Stop the tactile reader threads + release serial ports LAST so we still
+        # have safety reads available while the robot is being homed in robot.close().
+        tactile.__exit__(None, None, None)
 
 
 # ───────── CLI ─────────
@@ -649,9 +876,34 @@ def parse_args() -> XArmInferenceConfig:
     p.add_argument("--auto-start", action="store_true",
                    help="Skip the manual ENTER prompt before the first action.")
     p.add_argument("--dry-run", action="store_true",
-                   help="Run the full inference loop but don't connect to / move the robot.")
+                   help="Run the full inference loop but don't connect to / move the robot. "
+                        "Tactile sensors are STILL required (script hard-fails without them).")
     p.add_argument("--no-video", dest="save_video", action="store_false", default=True)
     p.add_argument("--video-path", type=Path, default=None)
+
+    # Tactile safety — see XArmInferenceConfig for the rationale on these defaults.
+    p.add_argument("--left-port", type=str, default="/dev/ttyACM0",
+                   help="Serial port for the LEFT-finger ESP32 (default /dev/ttyACM0).")
+    p.add_argument("--right-port", type=str, default="/dev/ttyACM1",
+                   help="Serial port for the RIGHT-finger ESP32 (default /dev/ttyACM1).")
+    p.add_argument("--tactile-baud", type=int, default=115200)
+    p.add_argument("--safety-metric", type=str, default="sum_abs_z",
+                   choices=["sum_abs_z", "max_abs_z", "max_norm"],
+                   help="Reduction over per-taxel xyz used to detect contact. "
+                        "sum_abs_z is what tactile-data-collection settled on; "
+                        "max_abs_z does NOT work for this sensor mounting.")
+    p.add_argument("--safety-threshold", type=float, default=1500.0,
+                   help="Delta-from-idle metric above this -> hold grasp (no further closing). "
+                        "Default 1500 matches tactile_config.SAFETY_THRESHOLD; raise to allow "
+                        "harder grip before clamping.")
+    p.add_argument("--stale-after-sec", type=float, default=0.2,
+                   help="Tactile readings older than this count as unsafe (fail-safe).")
+    p.add_argument("--baseline-duration-sec", type=float, default=1.5,
+                   help="How long to average per-cell xyz at rest after homing.")
+    p.add_argument("--tactile-init-timeout-sec", type=float, default=5.0,
+                   help="Hard-fail if both boards aren't streaming a fresh frame "
+                        "within this window after open.")
+
     args = p.parse_args()
 
     return XArmInferenceConfig(
@@ -671,6 +923,14 @@ def parse_args() -> XArmInferenceConfig:
         dry_run=args.dry_run,
         save_video=args.save_video,
         video_path=args.video_path,
+        left_port=args.left_port,
+        right_port=args.right_port,
+        tactile_baud=args.tactile_baud,
+        safety_metric=args.safety_metric,
+        safety_threshold=args.safety_threshold,
+        stale_after_sec=args.stale_after_sec,
+        baseline_duration_sec=args.baseline_duration_sec,
+        tactile_init_timeout_sec=args.tactile_init_timeout_sec,
     )
 
 
