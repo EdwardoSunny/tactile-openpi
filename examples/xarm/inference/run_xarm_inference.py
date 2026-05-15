@@ -66,8 +66,9 @@ from openpi.policies import policy_config
 from openpi.training import config as _config
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 log = logging.getLogger("xarm-infer")
+log.setLevel(logging.INFO)
 
 
 # ───────── config dataclass ─────────
@@ -92,13 +93,27 @@ class XArmInferenceConfig:
     home_speed: float = 50.0  # deg/s for the homing motion
 
     # Cameras
-    # NOTE: production data collection (collect_xarm_demos.py) uses plain
-    # cv2.VideoCapture with integer USB indices — not the RealSense SDK — so we
-    # default to the same here. Use --use-realsense only if you specifically
-    # want the RealSense SDK path AND know the camera serial numbers.
-    agent_cam_id: int | str = 0
-    wrist_cam_id: int | str = 2
-    use_realsense: bool = False
+    # Two paths are supported:
+    #   - RealSense (default): goes through pyrealsense2. agent/wrist IDs may be either
+    #     a 12-digit serial number ('327122079374') OR a small int (0, 1) interpreted
+    #     as an index into the enumerated device list. If unset, the first two D-series
+    #     devices found are used (agent=0, wrist=1).
+    #   - OpenCV (--no-realsense): cv2.VideoCapture with USB indices like 0, 2 — useful
+    #     when only USB webcams are attached.
+    agent_cam_id: int | str | None = None
+    wrist_cam_id: int | str | None = None
+    use_realsense: bool = True
+    # RealSense capture parameters — must match the collection-time settings, otherwise
+    # the deployment-time pixel distribution differs from training and the policy
+    # silently collapses to a noop attractor. Defaults below mirror the vla-finetune
+    # collect/inference pipeline (1280x720 @ 30 fps, manual exposure=120, gain=0,
+    # white_balance=5900K, all auto disabled).
+    rs_width: int = 1280
+    rs_height: int = 720
+    rs_fps: int = 30
+    rs_exposure: int = 120
+    rs_gain: int = 0
+    rs_white_balance: int = 5900
     image_size: int = 224
 
     # Task
@@ -188,9 +203,9 @@ class ThreadedCamera:
 class CameraManager:
     """Returns (agent, wrist) RGB uint8 frames at `image_size`×`image_size`.
 
-    Defaults to plain OpenCV USB capture — this is what production data
-    collection uses (collect_xarm_demos.py). Set `use_realsense=True` to go
-    through pyrealsense2 (only works with real D400 serial numbers).
+    Defaults to RealSense (pyrealsense2). Set `use_realsense=False` to fall back
+    to plain OpenCV USB capture (cv2.VideoCapture with integer USB indices),
+    which is what collect_xarm_demos.py uses.
     """
 
     def __init__(self, cfg: XArmInferenceConfig) -> None:
@@ -207,41 +222,134 @@ class CameraManager:
             except (TypeError, ValueError):
                 return v  # leave as path / string source
 
-        agent_src = _maybe_int(cfg.agent_cam_id)
-        wrist_src = _maybe_int(cfg.wrist_cam_id)
+        agent_src = _maybe_int(cfg.agent_cam_id if cfg.agent_cam_id is not None else 0)
+        wrist_src = _maybe_int(cfg.wrist_cam_id if cfg.wrist_cam_id is not None else 2)
         log.info("Opening cameras via cv2.VideoCapture: agent=%r, wrist=%r (matching collect_xarm_demos.py)",
                  agent_src, wrist_src)
         self.agent_cam = ThreadedCamera(agent_src, cfg.image_size)
         self.wrist_cam = ThreadedCamera(wrist_src, cfg.image_size)
 
-    def _init_realsense(self) -> None:
-        # Opt-in RealSense SDK path. Requires REAL serial numbers (12-digit strings)
-        # in --agent-cam-id / --wrist-cam-id, not OpenCV indices. Use
-        # `python -c "import pyrealsense2 as rs; [print(d.get_info(rs.camera_info.serial_number)) for d in rs.context().query_devices()]"`
-        # to discover them.
-        import pyrealsense2 as rs
+    @staticmethod
+    def _resolve_realsense_serial(rs_module, raw, available: list[str], default_idx: int) -> str:
+        """Map a CLI cam-id (None, an int-like 0/1, or a 12-digit serial) to a serial.
 
-        if not any(c.isdigit() for c in str(self.cfg.agent_cam_id)) or \
-           not any(c.isdigit() for c in str(self.cfg.wrist_cam_id)):
-            raise RuntimeError("--use-realsense requires real serial numbers in --agent-cam-id / --wrist-cam-id.")
+        Pure logic, no side-effects — easy to test if anyone wants to.
+        """
+        if raw is None:
+            if default_idx >= len(available):
+                raise RuntimeError(
+                    f"Need {default_idx + 1} RealSense device(s) but only {len(available)} found: {available}"
+                )
+            return available[default_idx]
+        raw_str = str(raw)
+        # 12-digit serial? Use it directly (validate it's actually attached).
+        if raw_str.isdigit() and len(raw_str) >= 6:
+            if raw_str not in available:
+                raise RuntimeError(
+                    f"RealSense serial {raw_str!r} not found among attached devices {available}"
+                )
+            return raw_str
+        # Small int? Treat as index into the enumerated device list.
+        try:
+            idx = int(raw_str)
+        except ValueError as e:
+            raise RuntimeError(f"Bad --*-cam-id value: {raw!r}") from e
+        if idx < 0 or idx >= len(available):
+            raise RuntimeError(
+                f"RealSense index {idx} out of range; only {len(available)} device(s): {available}"
+            )
+        return available[idx]
+
+    def _init_realsense(self) -> None:
+        """Open both RealSense color streams.
+
+        Mirrors the vla-finetune CameraManager (experiments/robot/xarm/run_xarm_inference.py):
+        1280x720 BGR8 @ 30 fps, manual exposure=120, gain=0, white_balance=5900K, with
+        all auto- modes disabled. These settings have to match the data collection
+        pipeline otherwise the model sees an out-of-distribution color cast / exposure
+        and collapses to predicting noop actions.
+        """
+        try:
+            import pyrealsense2 as rs
+        except ImportError as e:
+            raise SystemExit(
+                "pyrealsense2 not found. Install with: "
+                "uv pip install pyrealsense2  (or .venv/bin/pip install pyrealsense2)"
+            ) from e
+
+        ctx = rs.context()
+        attached = [d.get_info(rs.camera_info.serial_number) for d in ctx.query_devices()]
+        if not attached:
+            raise RuntimeError("No RealSense devices found. Plug in the cameras or use --no-realsense.")
+        log.info("Found %d RealSense device(s): %s", len(attached), attached)
+
+        agent_serial = self._resolve_realsense_serial(rs, self.cfg.agent_cam_id, attached, default_idx=0)
+        wrist_serial = self._resolve_realsense_serial(rs, self.cfg.wrist_cam_id, attached, default_idx=1)
+        if agent_serial == wrist_serial:
+            raise RuntimeError(
+                f"agent and wrist resolved to the same camera ({agent_serial}); "
+                f"available serials: {attached}"
+            )
 
         self.agent_pipe = rs.pipeline()
         self.wrist_pipe = rs.pipeline()
-        for pipe, dev in ((self.agent_pipe, self.cfg.agent_cam_id), (self.wrist_pipe, self.cfg.wrist_cam_id)):
+        profiles = {}
+        for pipe, serial, label in ((self.agent_pipe, agent_serial, "agent"),
+                                    (self.wrist_pipe, wrist_serial, "wrist")):
             cfg_rs = rs.config()
-            cfg_rs.enable_device(str(dev))
-            cfg_rs.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
-            pipe.start(cfg_rs)
+            cfg_rs.enable_device(serial)
+            cfg_rs.enable_stream(
+                rs.stream.color, self.cfg.rs_width, self.cfg.rs_height, rs.format.bgr8, self.cfg.rs_fps,
+            )
+            try:
+                profiles[label] = pipe.start(cfg_rs)
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"Failed to start RealSense pipeline for {label}={serial}: {e}. "
+                    f"Is another process holding the camera? Try `pkill -f realsense` or replug."
+                ) from e
+
+        # Apply manual exposure / white-balance to match collection. Color sensor is
+        # index 1 on the D435 (index 0 is the stereo/IR module).
+        for label, profile in profiles.items():
+            color_sensor = None
+            for s in profile.get_device().query_sensors():
+                if s.supports(rs.option.enable_auto_exposure) and s.supports(rs.option.white_balance):
+                    color_sensor = s
+                    break
+            if color_sensor is None:
+                log.warning("Could not locate color sensor for %s; skipping manual exposure/WB.", label)
+                continue
+            color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+            color_sensor.set_option(rs.option.exposure, self.cfg.rs_exposure)
+            color_sensor.set_option(rs.option.gain, self.cfg.rs_gain)
+            color_sensor.set_option(rs.option.enable_auto_white_balance, 0)
+            color_sensor.set_option(rs.option.white_balance, self.cfg.rs_white_balance)
+
+        # Warm-up: AE/AWB take a few frames to converge even when disabled.
         for _ in range(30):
             self.agent_pipe.wait_for_frames()
             self.wrist_pipe.wait_for_frames()
-        log.info("RealSense initialized (agent=%s, wrist=%s, 1280x720@30)",
-                 self.cfg.agent_cam_id, self.cfg.wrist_cam_id)
+
+        self._agent_serial = agent_serial
+        self._wrist_serial = wrist_serial
+        log.info(
+            "RealSense ready: agent=%s, wrist=%s  (%dx%d @ %d fps, exposure=%d, wb=%dK)",
+            agent_serial, wrist_serial,
+            self.cfg.rs_width, self.cfg.rs_height, self.cfg.rs_fps,
+            self.cfg.rs_exposure, self.cfg.rs_white_balance,
+        )
 
     def get_observation(self) -> Tuple[np.ndarray, np.ndarray]:
         if self.cfg.use_realsense:
-            agent_bgr = np.asanyarray(self.agent_pipe.wait_for_frames().get_color_frame().get_data())
-            wrist_bgr = np.asanyarray(self.wrist_pipe.wait_for_frames().get_color_frame().get_data())
+            agent_frames = self.agent_pipe.wait_for_frames()
+            wrist_frames = self.wrist_pipe.wait_for_frames()
+            agent_color = agent_frames.get_color_frame()
+            wrist_color = wrist_frames.get_color_frame()
+            if not agent_color or not wrist_color:
+                raise RuntimeError("RealSense returned an empty color frame")
+            agent_bgr = np.asanyarray(agent_color.get_data())
+            wrist_bgr = np.asanyarray(wrist_color.get_data())
             agent = cv2.resize(cv2.cvtColor(agent_bgr, cv2.COLOR_BGR2RGB),
                                (self.cfg.image_size, self.cfg.image_size), interpolation=cv2.INTER_AREA)
             wrist = cv2.resize(cv2.cvtColor(wrist_bgr, cv2.COLOR_BGR2RGB),
@@ -255,11 +363,17 @@ class CameraManager:
 
     def close(self) -> None:
         if self.cfg.use_realsense:
-            self.agent_pipe.stop()
-            self.wrist_pipe.stop()
+            for pipe in (getattr(self, "agent_pipe", None), getattr(self, "wrist_pipe", None)):
+                if pipe is not None:
+                    try:
+                        pipe.stop()
+                    except Exception as e:
+                        log.warning("RealSense pipe.stop() failed: %s", e)
         else:
-            self.agent_cam.close()
-            self.wrist_cam.close()
+            if hasattr(self, "agent_cam"):
+                self.agent_cam.close()
+            if hasattr(self, "wrist_cam"):
+                self.wrist_cam.close()
 
 
 # ───────── xArm controller ─────────
@@ -516,12 +630,17 @@ def parse_args() -> XArmInferenceConfig:
     p.add_argument("--train-config-name", type=str, default="pi05_xarm_finetune_lora")
     p.add_argument("--xarm-ip", type=str, default="192.168.1.223")
     p.add_argument("--control-hz", type=int, default=10)
-    p.add_argument("--agent-cam-id", type=str, default="0")
-    p.add_argument("--wrist-cam-id", type=str, default="2")
-    p.add_argument("--use-realsense", action="store_true",
-                   help="Use pyrealsense2 with real D400 serial numbers in --agent-cam-id / "
-                        "--wrist-cam-id. Default is plain cv2.VideoCapture with USB indices, "
-                        "matching production data collection (collect_xarm_demos.py).")
+    p.add_argument("--agent-cam-id", type=str, default=None,
+                   help="RealSense: 12-digit serial OR small index (0/1) into the enumerated "
+                        "device list (default 0 = first device). OpenCV (--no-realsense): "
+                        "USB index, default 0.")
+    p.add_argument("--wrist-cam-id", type=str, default=None,
+                   help="RealSense: serial or index (default 1). OpenCV: USB index (default 2).")
+    rs_group = p.add_mutually_exclusive_group()
+    rs_group.add_argument("--use-realsense", dest="use_realsense", action="store_true", default=True,
+                          help="Use pyrealsense2 (default). Cameras auto-discovered if cam-ids unset.")
+    rs_group.add_argument("--no-realsense", dest="use_realsense", action="store_false",
+                          help="Use plain cv2.VideoCapture instead of pyrealsense2.")
     p.add_argument("--prompt", type=str, default="pick up the red block")
     p.add_argument("--max-steps", type=int, default=200)
     p.add_argument("--replan-steps", type=int, default=5)
