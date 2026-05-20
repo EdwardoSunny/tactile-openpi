@@ -534,6 +534,19 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
+    # Loss-saturation early stopping (JAX trainer only; train_pytorch.py ignores these).
+    # Disabled by default so existing configs keep their current behavior. When enabled, the
+    # trainer compares the rolling-window mean of training loss in the most recent
+    # `early_stop_window` steps against the window immediately before it; if the relative
+    # improvement is below `early_stop_relative_threshold` for `early_stop_patience`
+    # consecutive checks (and we're past `early_stop_min_steps`), training exits cleanly
+    # and the final checkpoint is saved at the current step.
+    early_stop_enabled: bool = False
+    early_stop_min_steps: int = 3_000
+    early_stop_window: int = 1_000             # steps per window (must be a multiple of log_interval)
+    early_stop_relative_threshold: float = 0.005  # 0.5% relative improvement
+    early_stop_patience: int = 2               # consecutive saturated checks before exit
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""
@@ -826,6 +839,60 @@ _CONFIGS = [
         num_train_steps=20_000,
         save_interval=2_000,
     ),
+    # Per-task xArm LoRA finetunes — cube and tube, raw vs arrow-overlay images.
+    # Four runs total (two tasks × {plain, arrow}). Same hyperparameters as
+    # pi05_xarm_finetune_lora above; only `name`, `repo_id`, and the early-stop
+    # toggle differ. early_stop_enabled=True so each run exits when loss flattens
+    # (rolling 1k-step window mean improves <0.5% for 2 consecutive checks past
+    # step 3000); 20k is the hard cap.
+    # wandb is disabled in these because the host doesn't have WANDB_API_KEY
+    # configured — turn it back on if you want logging.
+    *[
+        TrainConfig(
+            name=name,
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
+            data=LeRobotLiberoDataConfig(
+                repo_id=repo_id,
+                base_config=DataConfig(prompt_from_task=True),
+                extra_delta_transform=False,
+            ),
+            batch_size=8,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=500,
+                peak_lr=1e-4,
+                decay_steps=20_000,
+                decay_lr=1e-5,
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=None,
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_droid/params"
+            ),
+            freeze_filter=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),
+            num_train_steps=20_000,
+            save_interval=2_000,
+            early_stop_enabled=True,
+            wandb_enabled=False,
+        )
+        for name, repo_id in [
+            ("pi05_xarm_cube_raw_lora",   "local/xarm_cube"),
+            ("pi05_xarm_cube_arrow_lora", "local/xarm_cube_arrow"),
+            ("pi05_xarm_tube_raw_lora",   "local/xarm_tube"),
+            ("pi05_xarm_tube_arrow_lora", "local/xarm_tube_arrow"),
+        ]
+    ],
     # LoRA variant of pi05_libero_finetune — fits on a single GPU (>22.5 GB). Starts from
     # pi05_libero, freezes base weights, only LoRA adapters are trained.
     TrainConfig(

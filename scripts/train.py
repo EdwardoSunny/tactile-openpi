@@ -255,11 +255,40 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
+    # Early stopping bookkeeping: ring of (loss-per-log-interval) values. We compute
+    # window means over `windows_per_check` log-intervals (= early_stop_window steps),
+    # and consider the loss "saturated" when the most-recent window's mean has not
+    # improved by more than `early_stop_relative_threshold` relative to the window
+    # immediately before it. `patience` consecutive saturated checks => exit.
+    es_enabled = bool(config.early_stop_enabled)
+    if es_enabled:
+        if config.early_stop_window % config.log_interval != 0:
+            raise ValueError(
+                f"early_stop_window ({config.early_stop_window}) must be a multiple of "
+                f"log_interval ({config.log_interval})."
+            )
+        windows_per_check = config.early_stop_window // config.log_interval
+        # Need 2 * windows_per_check log entries to make the first comparison.
+        es_history: list[float] = []
+        es_saturated_streak = 0
+        logging.info(
+            "Early stopping enabled: min_steps=%d window=%d steps (%d log-intervals) "
+            "rel_thresh=%.4f patience=%d",
+            config.early_stop_min_steps,
+            config.early_stop_window,
+            windows_per_check,
+            config.early_stop_relative_threshold,
+            config.early_stop_patience,
+        )
+
     infos = []
+    last_step = start_step
+    early_stopped = False
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
+        last_step = step
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
@@ -267,10 +296,39 @@ def main(config: _config.TrainConfig):
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
+
+            if es_enabled and step >= config.early_stop_min_steps:
+                es_history.append(float(reduced_info["loss"]))
+                if len(es_history) >= 2 * windows_per_check:
+                    prev_mean = float(np.mean(es_history[-2 * windows_per_check : -windows_per_check]))
+                    curr_mean = float(np.mean(es_history[-windows_per_check:]))
+                    rel = (prev_mean - curr_mean) / max(prev_mean, 1e-12)
+                    saturated = rel < config.early_stop_relative_threshold
+                    es_saturated_streak = es_saturated_streak + 1 if saturated else 0
+                    pbar.write(
+                        f"  [early-stop] window means prev={prev_mean:.5f} "
+                        f"curr={curr_mean:.5f} rel_improve={rel:+.4%} "
+                        f"saturated_streak={es_saturated_streak}/{config.early_stop_patience}"
+                    )
+                    if es_saturated_streak >= config.early_stop_patience:
+                        logging.info(
+                            "Early stopping at step %d: loss saturated "
+                            "(rel improvement %.4f%% < threshold %.4f%% for %d checks)",
+                            step, rel * 100, config.early_stop_relative_threshold * 100,
+                            es_saturated_streak,
+                        )
+                        early_stopped = True
+                        break
+
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+
+    # If we exited the loop via early stopping (not the natural end), save a final
+    # checkpoint at the current step so the trained weights aren't lost.
+    if early_stopped:
+        _checkpoints.save_state(checkpoint_manager, train_state, data_loader, last_step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

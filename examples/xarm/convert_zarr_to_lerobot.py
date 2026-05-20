@@ -1,19 +1,25 @@
 """Convert phone-teleop xArm zarr dataset to a LeRobot dataset for openpi fine-tuning.
 
-Input zarr schema (from phone_data_collection/recorder.py):
+Input zarr schema — the OVERLAY-augmented zarr produced by
+``scripts/render_overlays.py`` in the tactile-data-collection repo:
+
     /data
-        state          (N, 7)  float32  [x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg, grasp{0,1}]
-        img_0          (N, 224, 224, 3) float32  agentview, [0,1], **tactile arrow overlay drawn on top**
-        img_0_raw      (N, 224, 224, 3) float32  agentview, no overlay (kept for analysis; we do NOT train on it)
-        img_1, img_1_raw                          same, wrist-mounted camera
-        n_contacts     (N, 1)  float32  number of taxels in contact (drives the arrow overlay; can be all-zero)
-        tactile, ...   raw force readings (not consumed by training, only the overlay rendering)
+        state                (N, 7)  float32  [x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg, grasp{0,1}]
+        img_0                (N, 224, 224, 3) float32 [0,1]  RAW (no overlay) agentview
+        img_0_arrow / _grid / _point / _bar                  same agentview with the named overlay drawn
+        img_1, img_1_*       same for the wrist-mounted camera
+        n_contacts, tactile, tactile_connected, tactile_ts_ms, tactile_lag_ms
+                                                             raw force readings; not consumed by training
     /meta
-        episode_ends   (E,)    int64    cumulative episode boundary indices
+        episode_ends         (E,) int64        cumulative episode boundary indices
+        tactile_baseline     (2, 9, 3) float32  one-time idle field (informational)
+        camera_serials, camera_intrinsics_native, camera_native_size,
+        agent_camera_serial, wrist_camera_serial, trc_agent, recorded_img_size
+                                                 camera metadata (informational)
 
 Output LeRobot dataset (matches openpi's LIBERO schema, so LeRobotLiberoDataConfig works as-is):
-    image          uint8 (224, 224, 3)  <- img_0           (arrow-overlay agentview)
-    wrist_image    uint8 (224, 224, 3)  <- img_1           (arrow-overlay wrist)
+    image          uint8 (224, 224, 3)  <- img_0 in the chosen overlay mode (see --mode)
+    wrist_image    uint8 (224, 224, 3)  <- img_1 in the chosen overlay mode
     state          float32 (8,)         <- [ee_pos_m(3), ee_ori_axis_angle_rad(3), grasp, grasp]
     actions        float32 (7,)         <- [dxyz_m(3), daxis_angle_rad(3), grasp{-1=open,+1=close}]
 
@@ -21,13 +27,17 @@ Action = tcp[t+1] - tcp[t] (delta), matching pi0.5/LIBERO convention. The last f
 episode is dropped because there is no t+1. Leading "paused" frames are also trimmed so the
 policy doesn't learn 'this scene -> noop' attractors.
 
-The tactile arrow overlay is *part of the training signal*. At deployment, the same overlay
-must be re-rendered onto the live camera feed before the model sees it.
+The tactile overlay (if any) is *part of the training signal*. At deployment, the same overlay
+must be re-rendered onto the live camera feed before the model sees it. Pass --mode raw to
+fine-tune on un-overlaid frames; pass --mode arrow/grid/point/bar to fine-tune on a specific
+overlay rendering. The five modes are ablation-comparable because the underlying recording is
+identical — only the burned-in overlay differs.
 
 Usage:
     uv run examples/xarm/convert_zarr_to_lerobot.py \\
-        --zarr /data/edward/teleop_data.zarr \\
-        --repo-id local/xarm_teleop \\
+        --zarr /data/edward/teleop_data_overlay.zarr \\
+        --mode arrow \\
+        --repo-id local/xarm_teleop_arrow \\
         --language "pick up the red block"
 """
 
@@ -51,25 +61,53 @@ PAUSE_RPY_DEG_THRESHOLD = 0.5
 CONTROL_HZ = 10
 
 
+# Overlay modes available in teleop_data_overlay.zarr (output of
+# scripts/render_overlays.py). "raw" reads the bare img_{i} arrays
+# (un-overlaid frames); any other value reads img_{i}_<mode>.
+# The newer overlay renderer (post-2026-05-19) uses points{N}_arrow style
+# names where N is the number of arrows per finger; we accept those too so
+# this converter handles both schemas without manual fix-up.
+_OVERLAY_MODES = (
+    "raw",
+    "arrow", "grid", "point", "bar",                 # legacy renderer
+    "points1_arrow", "points9_arrow",                # new renderer (preferred)
+    "points1_contact_flat", "points1_contact_spatial",
+    "points9_color_flat", "points9_color_spatial",
+)
+
+
 @dataclasses.dataclass
 class Args:
-    zarr: Path = Path("/data/edward/teleop_data.zarr")
+    zarr: Path = Path("/data/edward/teleop_data_overlay.zarr")
     repo_id: str = "local/xarm_teleop"
     language: str = "pick up the red block"
+    # Which overlay variant to use as the training image. "raw" = no overlay;
+    # arrow/grid/point/bar = the corresponding rendering from render_overlays.py.
+    # The repo_id is NOT auto-suffixed with the mode — pick a distinct repo_id
+    # per ablation (e.g. local/xarm_teleop_arrow) so they don't overwrite.
+    mode: str = "arrow"
     # If True, skip episodes with no grasp open->close transition (operator forgot to grasp).
     require_grasp_transition: bool = True
 
 
-def _pick_image_key(g: zarr.Group, cam_idx: int) -> str:
-    """Prefer img_{i} (arrow-overlay) over img_{i}_raw. See module docstring."""
-    overlay = f"data/img_{cam_idx}"
-    raw = f"data/img_{cam_idx}_raw"
-    if overlay in g:
-        return overlay
-    if raw in g:
-        logger.warning("No img_%d overlay stream; falling back to img_%d_raw", cam_idx, cam_idx)
-        return raw
-    raise KeyError(f"Neither {overlay} nor {raw} present in zarr")
+def _pick_image_key(g: zarr.Group, cam_idx: int, mode: str) -> str:
+    """Resolve the zarr key for camera ``cam_idx`` in the requested overlay mode.
+
+    Schema (post-2026-05-15 refactor of the tactile-data-collection repo):
+      - mode == "raw"  -> data/img_{cam_idx}            (un-overlaid)
+      - mode == "arrow"/"grid"/"point"/"bar"
+                       -> data/img_{cam_idx}_<mode>     (overlay burned in)
+    """
+    if mode not in _OVERLAY_MODES:
+        raise ValueError(f"mode must be one of {_OVERLAY_MODES}, got {mode!r}")
+    key = f"data/img_{cam_idx}" if mode == "raw" else f"data/img_{cam_idx}_{mode}"
+    if key not in g:
+        available = sorted(k for k in g["data"].keys() if k.startswith("img_"))
+        raise KeyError(
+            f"missing zarr key {key!r}; available image keys: {available}. "
+            f"Did you run scripts/render_overlays.py on the raw zarr first?"
+        )
+    return key
 
 
 def _tcp_to_delta_actions(tcp_pose_mm_deg: np.ndarray) -> np.ndarray:
@@ -102,9 +140,10 @@ def main(args: Args) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     g = zarr.open(str(args.zarr), mode="r")
     ep_ends = np.asarray(g["meta/episode_ends"][:])
-    img0_key = _pick_image_key(g, 0)
-    img1_key = _pick_image_key(g, 1)
-    logger.info("zarr=%s, episodes=%d, image keys: %s, %s", args.zarr, len(ep_ends), img0_key, img1_key)
+    img0_key = _pick_image_key(g, 0, args.mode)
+    img1_key = _pick_image_key(g, 1, args.mode)
+    logger.info("zarr=%s, mode=%s, episodes=%d, image keys: %s, %s",
+                args.zarr, args.mode, len(ep_ends), img0_key, img1_key)
 
     out_path = HF_LEROBOT_HOME / args.repo_id
     if out_path.exists():
