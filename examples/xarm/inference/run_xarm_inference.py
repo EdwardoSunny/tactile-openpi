@@ -54,11 +54,16 @@ Tactile gripper safety (mandatory):
     safety clamp actually corresponds to a physical "stop here" rather than
     "next tick try to slam to 0 again".
 
-The tactile arrow overlay (drawn on training-time `img_0`/`img_1`) is left as a stub
-hook in `apply_tactile_overlay`. The teleop_data.zarr we trained on had `n_contacts`
-all-zero, so the trained model never saw arrows — running with the hook as identity is
-correct for THIS checkpoint. If you later retrain on data with real tactile contacts,
-fill in the hook with the same renderer the collection pipeline used.
+Tactile arrow overlay (matches training-time `img_{0,1}_points1_arrow` etc.):
+    Pass `--overlay-stats <path/to/overlay_norm.npz>` to enable. The npz is
+    produced by `examples/xarm/inference/extract_overlay_norm.py` from the
+    same training overlay zarrs (which embed /meta/normalization written by
+    phone_data_collection's compute_overlay_normalization.py). When the flag
+    is set, every camera frame fed to the policy is overlay-rendered with
+    the SAME pipeline used at training (Hampel raw clip + per-rollout
+    baseline subtract + cross-task pooled scales + adaptive deadband + the
+    chosen overlay variant via sensordrawing). Without it, raw frames are
+    sent (only correct for checkpoints trained on raw img_0/img_1).
 """
 
 from __future__ import annotations
@@ -126,8 +131,8 @@ class XArmInferenceConfig:
     #     devices found are used (agent=0, wrist=1).
     #   - OpenCV (--no-realsense): cv2.VideoCapture with USB indices like 0, 2 — useful
     #     when only USB webcams are attached.
-    agent_cam_id: int | str | None = None
-    wrist_cam_id: int | str | None = None
+    agent_cam_id: int | str | None = "327122079374"
+    wrist_cam_id: int | str | None = "332322072612"
     use_realsense: bool = True
     # RealSense capture parameters — must match the collection-time settings, otherwise
     # the deployment-time pixel distribution differs from training and the policy
@@ -170,6 +175,33 @@ class XArmInferenceConfig:
     save_video: bool = True
     video_path: Path | None = None
 
+    # Live operator visualization window.
+    # If True, pops a cv2 window each control tick showing agent | wrist with the
+    # tactile force arrows drawn (mirrors what the collection-time --viz window shows).
+    # Model input path is unchanged by this flag alone — this is operator debug only.
+    show_windows: bool = False
+    # Path to the phone_data_collection repo (provides environment.tactile_overlay.SensorOverlay).
+    # Override if the repo lives elsewhere on the deployment host. Shared by both
+    # the operator-only LiveViz path AND the policy-input InferenceOverlay path.
+    viz_overlay_repo: str = "/home/u-ril/edward/phone_data_collection"
+    viz_mode_key: str = "points1_arrow"  # closest live equivalent to the legacy 'arrow' overlay
+
+    # Policy-input tactile overlay (MUST match the training-time renderer).
+    # If `overlay_stats_path` is set, every camera frame fed to the policy gets
+    # the overlay drawn on it using stats extracted from the training overlay
+    # zarrs by examples/xarm/inference/extract_overlay_norm.py. The pipeline
+    # matches phone_data_collection/scripts/render_overlays.py exactly:
+    # Hampel raw clip -> subtract per-rollout baseline -> normalize with
+    # cross-task pooled scales -> adaptive deadband -> SensorOverlay.draw.
+    # If unset, no overlay is applied — only correct when the checkpoint was
+    # trained on raw frames (no overlay variant). Default unset to preserve
+    # legacy behavior; flip via --overlay-stats <path>.
+    overlay_stats_path: str | None = None
+    # Optional override of the mode_key stored inside the stats npz. Use this
+    # if you want to render a different variant than the one extract_overlay_norm.py
+    # baked in (rare; normally leave it None to match training).
+    overlay_mode_key: str | None = None
+
     def __post_init__(self) -> None:
         if self.save_video and self.video_path is None:
             stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -177,18 +209,84 @@ class XArmInferenceConfig:
 
 
 # ───────── tactile overlay hook ─────────
+#
+# The actual overlay rendering at inference time happens in
+# inference_overlay.InferenceOverlay (built in run() after the per-rollout
+# tactile baseline is captured). It mirrors the training-time renderer
+# (phone_data_collection/scripts/render_overlays.py) exactly. We don't ship
+# an identity-stub anymore — opt in by passing --overlay-stats <path>.
 
 
-def apply_tactile_overlay(img: np.ndarray, tactile_reading: np.ndarray | None) -> np.ndarray:
-    """Stub for re-rendering the tactile arrow overlay onto a live frame.
+# ───────── live operator visualization ─────────
 
-    For the current checkpoint (trained on teleop_data.zarr where n_contacts was all-zero),
-    no arrows were drawn at training time, so this can be identity. If you retrain with
-    real contact data, fill this in with the same renderer used at collection — otherwise
-    the deployment-time pixel distribution differs from training and the policy will fall
-    out of distribution.
+
+class LiveViz:
+    """Operator-only side-by-side cv2 window with tactile arrows drawn.
+
+    Uses environment.tactile_overlay.SensorOverlay from the phone_data_collection
+    repo (lazy import — only when --show-windows is set). The model never sees
+    these annotated frames; only the on-screen window is augmented.
+
+    Arrows are drawn at native 640x480 (where the sensordrawing kinematics
+    and per-finger calibration were computed) on a copy of each camera frame.
     """
-    return img
+
+    WINDOW_NAME = "tactile-openpi rollout (agent | wrist)"
+
+    def __init__(self, cfg: "XArmInferenceConfig", baseline: np.ndarray) -> None:
+        self.cfg = cfg
+        if cfg.viz_overlay_repo and cfg.viz_overlay_repo not in sys.path:
+            sys.path.insert(0, cfg.viz_overlay_repo)
+        try:
+            from environment.tactile_overlay import SensorOverlay  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                f"--show-windows requires environment.tactile_overlay from "
+                f"phone_data_collection (looked at {cfg.viz_overlay_repo!r}). "
+                f"Set --viz-overlay-repo to the right path or drop --show-windows. "
+                f"Underlying error: {e}"
+            ) from e
+        self.overlay = SensorOverlay(baseline=baseline)
+        cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.WINDOW_NAME, 1280, 480)
+        log.info("Live viz window opened (mode=%s).", cfg.viz_mode_key)
+
+    def update(
+        self,
+        agent_rgb: np.ndarray,
+        wrist_rgb: np.ndarray,
+        joint_angles_deg,
+        grip_pos_raw: float,
+        raw_L: np.ndarray | None,
+        raw_R: np.ndarray | None,
+    ) -> None:
+        # SensorOverlay expects BGR at 640x480.
+        agent_bgr = cv2.cvtColor(agent_rgb, cv2.COLOR_RGB2BGR)
+        wrist_bgr = cv2.cvtColor(wrist_rgb, cv2.COLOR_RGB2BGR)
+        agent_640 = cv2.resize(agent_bgr, (640, 480))
+        wrist_640 = cv2.resize(wrist_bgr, (640, 480))
+        nL, nR = self.overlay.normalize(raw_L, raw_R)
+        try:
+            agent_drawn = self.overlay.draw(
+                "side", agent_640, joint_angles_deg, float(grip_pos_raw),
+                nL, nR, mode_key=self.cfg.viz_mode_key,
+            )
+            wrist_drawn = self.overlay.draw(
+                "wrist", wrist_640, joint_angles_deg, float(grip_pos_raw),
+                nL, nR, mode_key=self.cfg.viz_mode_key,
+            )
+        except Exception as e:
+            log.warning("[viz] overlay draw failed: %s — showing plain frames", e)
+            agent_drawn, wrist_drawn = agent_640, wrist_640
+        composite = np.concatenate([agent_drawn, wrist_drawn], axis=1)
+        cv2.imshow(self.WINDOW_NAME, composite)
+        cv2.waitKey(1)
+
+    def close(self) -> None:
+        try:
+            cv2.destroyWindow(self.WINDOW_NAME)
+        except cv2.error:
+            pass
 
 
 # ───────── cameras ─────────
@@ -396,8 +494,10 @@ class CameraManager:
         else:
             agent = self.agent_cam.read()  # already RGB uint8 at image_size
             wrist = self.wrist_cam.read()
-        agent = apply_tactile_overlay(agent, None)
-        wrist = apply_tactile_overlay(wrist, None)
+        # Overlay is NOT applied here — it needs joint_angles, grip_pos, and
+        # tactile readings, which CameraManager doesn't have. The main loop
+        # (run()) applies the overlay via InferenceOverlay after fetching
+        # those inputs, before packing the obs dict.
         return agent, wrist
 
     def close(self) -> None:
@@ -749,6 +849,7 @@ def run(cfg: XArmInferenceConfig) -> None:
     cams: CameraManager | None = None
     robot: XArmController | None = None
     video: VideoRecorder | None = None
+    viz: LiveViz | None = None
     try:
         log.info("Loading policy via openpi…")
         train_cfg = _config.get_config(cfg.train_config_name)
@@ -772,6 +873,38 @@ def run(cfg: XArmInferenceConfig) -> None:
         # against cfg.safety_threshold (which is in delta units; see tactile_safety.py).
         baseline = _capture_tactile_baseline(tactile, cfg.baseline_duration_sec)
         tactile.config.baseline = baseline
+
+        # Policy-input overlay. Built only if --overlay-stats was passed; lives
+        # in inference_overlay.InferenceOverlay. Mirrors the training-time
+        # render_overlays.py pipeline (Hampel clip + baseline subtract +
+        # normalize + deadband + draw). The same `baseline` we just captured
+        # serves as the per-rollout offset (= per-episode offset at training).
+        inference_overlay = None
+        if cfg.overlay_stats_path:
+            from inference_overlay import InferenceOverlay  # local sibling file
+            inference_overlay = InferenceOverlay(
+                stats_path=cfg.overlay_stats_path,
+                phone_data_collection_repo=cfg.viz_overlay_repo,
+                baseline=baseline,
+                mode_key_override=cfg.overlay_mode_key,
+            )
+            log.info(
+                "InferenceOverlay enabled: mode=%s, arrow_length_scale=%.4f, "
+                "scale_xy=[%.1f, %.1f], scale_z=[%.1f, %.1f], deadband=%.4f",
+                inference_overlay.mode_key, inference_overlay.arrow_length_scale,
+                float(inference_overlay.scale_xy[0]), float(inference_overlay.scale_xy[1]),
+                float(inference_overlay.scale_z[0]), float(inference_overlay.scale_z[1]),
+                inference_overlay.deadband,
+            )
+        else:
+            log.warning(
+                "No --overlay-stats provided. Camera frames sent to the policy "
+                "will be RAW. Only correct if the checkpoint was trained on raw "
+                "(no-overlay) frames; otherwise expect a distribution shift."
+            )
+
+        if cfg.show_windows:
+            viz = LiveViz(cfg, baseline)
         if robot is not None and not cfg.auto_start:
             input("Press ENTER to begin rollout (Ctrl+C to abort)…")
 
@@ -790,6 +923,45 @@ def run(cfg: XArmInferenceConfig) -> None:
             for step in range(cfg.max_steps):
                 t0 = time.time()
                 agent_rgb, wrist_rgb = cams.get_observation()
+
+                # If overlay or viz needs arm state + tactile, fetch them
+                # ONCE per tick. (Overlay needs them to draw; viz needs them
+                # for its own draw.)
+                need_arm_tactile = (inference_overlay is not None) or (viz is not None)
+                angles_deg = None
+                grip_raw = None
+                raw_L = raw_R = None
+                if need_arm_tactile:
+                    if robot is not None:
+                        code, angles_deg = robot.arm.get_servo_angle()
+                        if code != 0:
+                            angles_deg = list(cfg.home_joint_angles_deg)
+                        code2, grip_raw = robot.arm.get_gripper_position()
+                        if code2 != 0:
+                            grip_raw = 850
+                    else:
+                        angles_deg = list(cfg.home_joint_angles_deg)
+                        grip_raw = 850
+                    tac_states = tactile.get_latest()
+                    if len(tac_states) >= 1 and "xyz" in tac_states[0]:
+                        raw_L = np.asarray(tac_states[0]["xyz"], dtype=np.float32)
+                    if len(tac_states) >= 2 and "xyz" in tac_states[1]:
+                        raw_R = np.asarray(tac_states[1]["xyz"], dtype=np.float32)
+
+                # Draw the SAME overlay the training data was rendered with
+                # onto the policy-input frames. This is what eliminates the
+                # raw-vs-overlay distribution shift between training and
+                # inference. Fails open (returns input unchanged) if tactile
+                # data isn't available — never crashes the rollout over it.
+                if inference_overlay is not None:
+                    agent_rgb = inference_overlay.apply(
+                        agent_rgb, "side", angles_deg, float(grip_raw),
+                        raw_L, raw_R,
+                    )
+                    wrist_rgb = inference_overlay.apply(
+                        wrist_rgb, "wrist", angles_deg, float(grip_raw),
+                        raw_L, raw_R,
+                    )
 
                 if not action_plan:
                     if robot is not None:
@@ -821,6 +993,14 @@ def run(cfg: XArmInferenceConfig) -> None:
                     robot.execute_delta(action)
                 if video is not None:
                     video.write(agent_rgb, wrist_rgb)
+                if viz is not None:
+                    # Arm state + tactile already fetched at the top of this
+                    # tick (need_arm_tactile is True whenever viz is on). Note:
+                    # if InferenceOverlay is also on, agent_rgb/wrist_rgb here
+                    # already have the policy-input overlay drawn — viz will
+                    # show the same image the policy is seeing. That's the
+                    # intended behavior (visualizes the actual policy input).
+                    viz.update(agent_rgb, wrist_rgb, angles_deg, float(grip_raw), raw_L, raw_R)
 
                 elapsed = time.time() - t0
                 if elapsed < dt:
@@ -835,6 +1015,8 @@ def run(cfg: XArmInferenceConfig) -> None:
             if robot is not None:
                 robot.emergency_stop()
     finally:
+        if viz is not None:
+            viz.close()
         if video is not None:
             video.close()
         if cams is not None:
@@ -857,12 +1039,13 @@ def parse_args() -> XArmInferenceConfig:
     p.add_argument("--train-config-name", type=str, default="pi05_xarm_finetune_lora")
     p.add_argument("--xarm-ip", type=str, default="192.168.1.223")
     p.add_argument("--control-hz", type=int, default=10)
-    p.add_argument("--agent-cam-id", type=str, default=None,
+    p.add_argument("--agent-cam-id", type=str, default="327122079374",
                    help="RealSense: 12-digit serial OR small index (0/1) into the enumerated "
-                        "device list (default 0 = first device). OpenCV (--no-realsense): "
-                        "USB index, default 0.")
-    p.add_argument("--wrist-cam-id", type=str, default=None,
-                   help="RealSense: serial or index (default 1). OpenCV: USB index (default 2).")
+                        "device list. Default is the lab rig's agent (third-person) D-series "
+                        "serial. OpenCV (--no-realsense): USB index.")
+    p.add_argument("--wrist-cam-id", type=str, default="332322072612",
+                   help="RealSense: serial or index. Default is the lab rig's wrist-mounted "
+                        "D-series serial. OpenCV (--no-realsense): USB index.")
     rs_group = p.add_mutually_exclusive_group()
     rs_group.add_argument("--use-realsense", dest="use_realsense", action="store_true", default=True,
                           help="Use pyrealsense2 (default). Cameras auto-discovered if cam-ids unset.")
@@ -904,6 +1087,32 @@ def parse_args() -> XArmInferenceConfig:
                    help="Hard-fail if both boards aren't streaming a fresh frame "
                         "within this window after open.")
 
+    # Live operator viz (optional).
+    p.add_argument("--show-windows", action="store_true",
+                   help="Pop a cv2 window showing agent | wrist with tactile arrows "
+                        "drawn each tick. Operator debug only; model input is unchanged.")
+    p.add_argument("--viz-overlay-repo", type=str,
+                   default="/home/u-ril/edward/phone_data_collection",
+                   help="Path to phone_data_collection (provides environment.tactile_overlay).")
+    p.add_argument("--viz-mode-key", type=str, default="points1_arrow",
+                   help="Which renderer variant to draw (closest live equivalent to the "
+                        "legacy 'arrow' overlay is 'points1_arrow').")
+
+    # Policy-input tactile overlay — eliminates the raw-vs-overlay distribution
+    # shift between training and inference. The npz is produced by
+    # examples/xarm/inference/extract_overlay_norm.py from the same overlay
+    # zarrs you trained on.
+    p.add_argument("--overlay-stats", type=str, default=None,
+                   help="Path to overlay_norm.npz (from extract_overlay_norm.py). "
+                        "When set, every camera frame fed to the policy is "
+                        "overlaid using the SAME normalization the training "
+                        "data was rendered with. When unset, raw frames are "
+                        "sent (only correct for raw-trained checkpoints).")
+    p.add_argument("--overlay-mode-key", type=str, default=None,
+                   help="Override the mode_key stored inside the overlay-stats "
+                        "npz. Leave unset to use the one baked in (which "
+                        "matches the training render).")
+
     args = p.parse_args()
 
     return XArmInferenceConfig(
@@ -931,6 +1140,11 @@ def parse_args() -> XArmInferenceConfig:
         stale_after_sec=args.stale_after_sec,
         baseline_duration_sec=args.baseline_duration_sec,
         tactile_init_timeout_sec=args.tactile_init_timeout_sec,
+        show_windows=args.show_windows,
+        viz_overlay_repo=args.viz_overlay_repo,
+        viz_mode_key=args.viz_mode_key,
+        overlay_stats_path=args.overlay_stats,
+        overlay_mode_key=args.overlay_mode_key,
     )
 
 
