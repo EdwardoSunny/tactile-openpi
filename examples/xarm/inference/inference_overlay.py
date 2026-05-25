@@ -50,15 +50,24 @@ class InferenceOverlay:
         )
 
     Per frame:
-        out_rgb = ov.apply(
-            rgb_uint8_HWC,         # 224x224x3 RGB uint8 from CameraManager
+        out_bgr = ov.apply(
+            bgr_uint8_HWC,         # 224x224x3 BGR uint8 from CameraManager
             role,                  # "side" (agent cam) or "wrist"
             joint_angles_deg,      # iterable of 7 servo angles
             grip_pos_raw,          # float, 0..850 from arm.get_gripper_position
             raw_L, raw_R,          # (9, 3) tactile xyz per finger from tactile.get_latest()
         )
-        # out_rgb has the SAME shape/dtype as rgb_uint8_HWC, with the overlay
+        # out_bgr has the SAME shape/dtype as bgr_uint8_HWC, with the overlay
         # variant drawn on top. Ready to be packed into obs["observation/image"].
+
+    Color order: BGR in, BGR out — matches the training-side renderer
+    (phone_data_collection/scripts/render_overlays.py), which operates on
+    BGR bytes from the raw zarr and writes BGR bytes back into img_{i}_<key>.
+    Those BGR bytes are later relabeled as "RGB" by PIL inside
+    LeRobotDataset.add_frame (image_writer.image_array_to_pil_image), so the
+    model is trained on BGR-byte-content under the name `observation/image`.
+    Sending true RGB at inference would produce an R/B-channel-swapped
+    distribution shift; do NOT pre-convert to RGB.
 
     The baseline replaces the training-time per-episode offset. Update it
     whenever you re-home + recapture (call set_baseline). Without a baseline
@@ -128,24 +137,28 @@ class InferenceOverlay:
 
     def apply(
         self,
-        rgb_uint8_hwc: np.ndarray,
+        bgr_uint8_hwc: np.ndarray,
         role: str,
         joint_angles_deg,
         grip_pos_raw: float,
         raw_L: Optional[np.ndarray],
         raw_R: Optional[np.ndarray],
     ) -> np.ndarray:
-        """Render the overlay onto `rgb_uint8_hwc` and return the result with
+        """Render the overlay onto `bgr_uint8_hwc` and return the result with
         identical shape + dtype.
+
+        Color order is BGR throughout — see class docstring. The training-time
+        renderer (render_overlays.py) draws into a BGR buffer and stores BGR
+        bytes; we do the same here. No RGB<->BGR conversion at either end.
 
         If raw_L / raw_R are None or the baseline is missing, returns the
         input frame unchanged — same fail-open behavior as the training-time
         renderer when normalization fields are missing.
         """
         if raw_L is None or raw_R is None or self._baseline is None:
-            return rgb_uint8_hwc
+            return bgr_uint8_hwc
 
-        H, W = rgb_uint8_hwc.shape[:2]
+        H, W = bgr_uint8_hwc.shape[:2]
 
         # Stage 1: Hampel clip on raw, per-cell.
         L = np.clip(np.asarray(raw_L, dtype=np.float64),
@@ -162,11 +175,10 @@ class InferenceOverlay:
         nL = self._apply_deadband(nL, self.deadband)
         nR = self._apply_deadband(nR, self.deadband)
 
-        # Stage 4: draw on a 640x480 BGR canvas (where sensordrawing's K and
-        # T_rc are calibrated), then downsize back to the input HxW and convert
-        # back to RGB.
-        bgr = cv2.cvtColor(rgb_uint8_hwc, cv2.COLOR_RGB2BGR)
-        bgr_native = cv2.resize(bgr, (NATIVE_W, NATIVE_H))
+        # Stage 4: upscale to 640x480 (where sensordrawing's K and T_rc are
+        # calibrated), draw, then downsize back to the input HxW. Buffer is
+        # BGR throughout — same as render_overlays.py.
+        bgr_native = cv2.resize(bgr_uint8_hwc, (NATIVE_W, NATIVE_H))
         drawn_native = self.overlay.draw(
             role, bgr_native, joint_angles_deg, float(grip_pos_raw),
             nL, nR,
@@ -175,5 +187,4 @@ class InferenceOverlay:
             arrow_thickness=self.arrow_thickness,
             dot_size=self.dot_size,
         )
-        drawn_recorded = cv2.resize(drawn_native, (W, H))
-        return cv2.cvtColor(drawn_recorded, cv2.COLOR_BGR2RGB)
+        return cv2.resize(drawn_native, (W, H))

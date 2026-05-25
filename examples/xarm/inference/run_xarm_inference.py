@@ -202,6 +202,12 @@ class XArmInferenceConfig:
     # baked in (rare; normally leave it None to match training).
     overlay_mode_key: str | None = None
 
+    # Flow-matching sampler seed. None -> derive from wall clock + os.urandom so
+    # each fresh launch gets a different noise sequence (and therefore a
+    # different action chunk for the same observation). Pass an int to
+    # reproduce a specific rollout. Logged on policy load so you can replay.
+    seed: int | None = None
+
     def __post_init__(self) -> None:
         if self.save_video and self.video_path is None:
             stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -253,16 +259,15 @@ class LiveViz:
 
     def update(
         self,
-        agent_rgb: np.ndarray,
-        wrist_rgb: np.ndarray,
+        agent_bgr: np.ndarray,
+        wrist_bgr: np.ndarray,
         joint_angles_deg,
         grip_pos_raw: float,
         raw_L: np.ndarray | None,
         raw_R: np.ndarray | None,
     ) -> None:
-        # SensorOverlay expects BGR at 640x480.
-        agent_bgr = cv2.cvtColor(agent_rgb, cv2.COLOR_RGB2BGR)
-        wrist_bgr = cv2.cvtColor(wrist_rgb, cv2.COLOR_RGB2BGR)
+        # SensorOverlay + cv2.imshow both expect BGR — inputs are already BGR
+        # (the model-input channel order matches training; see CameraManager).
         agent_640 = cv2.resize(agent_bgr, (640, 480))
         wrist_640 = cv2.resize(wrist_bgr, (640, 480))
         nL, nR = self.overlay.normalize(raw_L, raw_R)
@@ -294,8 +299,12 @@ class LiveViz:
 
 class ThreadedCamera:
     """Mirrors collect_xarm_demos.py's ThreadedCamera. cv2.VideoCapture in a background
-    thread that always exposes the latest frame as RGB uint8, already resized to
-    (image_size, image_size). Fails fast if the device isn't producing frames."""
+    thread that always exposes the latest frame as BGR uint8, already resized to
+    (image_size, image_size). Fails fast if the device isn't producing frames.
+
+    Color order is BGR (the native order cv2.VideoCapture returns + the order
+    phone_data_collection records and stores). Do NOT convert to RGB here —
+    see inference_overlay.InferenceOverlay class docstring for why."""
 
     def __init__(self, source: int | str, image_size: int = 224) -> None:
         self.cap = cv2.VideoCapture(source)
@@ -321,11 +330,10 @@ class ThreadedCamera:
             if not ok or frame_bgr is None:
                 time.sleep(0.005)
                 continue
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            frame_rgb = cv2.resize(
-                frame_rgb, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA
+            frame_bgr = cv2.resize(
+                frame_bgr, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA
             )
-            self._latest = frame_rgb
+            self._latest = frame_bgr
 
     def read(self) -> np.ndarray:
         assert self._latest is not None
@@ -338,11 +346,15 @@ class ThreadedCamera:
 
 
 class CameraManager:
-    """Returns (agent, wrist) RGB uint8 frames at `image_size`×`image_size`.
+    """Returns (agent, wrist) BGR uint8 frames at `image_size`×`image_size`.
 
     Defaults to RealSense (pyrealsense2). Set `use_realsense=False` to fall back
     to plain OpenCV USB capture (cv2.VideoCapture with integer USB indices),
     which is what collect_xarm_demos.py uses.
+
+    Color order is BGR — matches phone_data_collection's capture path
+    (rs.format.bgr8) and what gets stored in the training-time zarrs. See
+    inference_overlay.InferenceOverlay class docstring for the full chain.
     """
 
     def __init__(self, cfg: XArmInferenceConfig) -> None:
@@ -487,12 +499,15 @@ class CameraManager:
                 raise RuntimeError("RealSense returned an empty color frame")
             agent_bgr = np.asanyarray(agent_color.get_data())
             wrist_bgr = np.asanyarray(wrist_color.get_data())
-            agent = cv2.resize(cv2.cvtColor(agent_bgr, cv2.COLOR_BGR2RGB),
+            # Keep BGR — matches phone_data_collection/environment/cameras.py
+            # (rs.format.bgr8) and the training-time zarr byte order. Do NOT
+            # convert to RGB; see InferenceOverlay class docstring.
+            agent = cv2.resize(agent_bgr,
                                (self.cfg.image_size, self.cfg.image_size), interpolation=cv2.INTER_AREA)
-            wrist = cv2.resize(cv2.cvtColor(wrist_bgr, cv2.COLOR_BGR2RGB),
+            wrist = cv2.resize(wrist_bgr,
                                (self.cfg.image_size, self.cfg.image_size), interpolation=cv2.INTER_AREA)
         else:
-            agent = self.agent_cam.read()  # already RGB uint8 at image_size
+            agent = self.agent_cam.read()  # already BGR uint8 at image_size
             wrist = self.wrist_cam.read()
         # Overlay is NOT applied here — it needs joint_angles, grip_pos, and
         # tactile readings, which CameraManager doesn't have. The main loop
@@ -743,9 +758,11 @@ class VideoRecorder:
         self.path = path
         log.info("Recording rollout to %s", path)
 
-    def write(self, agent_rgb: np.ndarray, wrist_rgb: np.ndarray) -> None:
-        frame = np.concatenate([agent_rgb, wrist_rgb], axis=1)
-        self.writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    def write(self, agent_bgr: np.ndarray, wrist_bgr: np.ndarray) -> None:
+        # Inputs are already BGR (matches training-time channel order);
+        # cv2.VideoWriter also expects BGR, so no conversion needed.
+        frame = np.concatenate([agent_bgr, wrist_bgr], axis=1)
+        self.writer.write(frame)
 
     def close(self) -> None:
         self.writer.release()
@@ -856,6 +873,19 @@ def run(cfg: XArmInferenceConfig) -> None:
         policy = policy_config.create_trained_policy(
             train_cfg, str(cfg.checkpoint), default_prompt=cfg.prompt
         )
+        # Reseed the flow-matching sampler. Without this, Policy.__init__
+        # defaults to jax.random.key(0), so every fresh launch reuses the
+        # same noise sequence — two runs against identical observations
+        # would produce identical action chunks. Derive a 32-bit seed from
+        # the wall clock unless the user pinned --seed for reproducibility.
+        if cfg.seed is None:
+            seed = int.from_bytes(os.urandom(4), "big")
+            log.info("Sampler seed (random): %d  (pin via --seed to reproduce)", seed)
+        else:
+            seed = int(cfg.seed) & 0xFFFFFFFF
+            log.info("Sampler seed (user-pinned): %d", seed)
+        import jax  # local import — openpi already pulled it in via create_trained_policy
+        policy._rng = jax.random.key(seed)
         log.info("Policy loaded.")
 
         cams = CameraManager(cfg)
@@ -922,7 +952,8 @@ def run(cfg: XArmInferenceConfig) -> None:
         try:
             for step in range(cfg.max_steps):
                 t0 = time.time()
-                agent_rgb, wrist_rgb = cams.get_observation()
+                # BGR uint8 throughout — see CameraManager + InferenceOverlay docstrings.
+                agent_bgr, wrist_bgr = cams.get_observation()
 
                 # If overlay or viz needs arm state + tactile, fetch them
                 # ONCE per tick. (Overlay needs them to draw; viz needs them
@@ -954,12 +985,12 @@ def run(cfg: XArmInferenceConfig) -> None:
                 # inference. Fails open (returns input unchanged) if tactile
                 # data isn't available — never crashes the rollout over it.
                 if inference_overlay is not None:
-                    agent_rgb = inference_overlay.apply(
-                        agent_rgb, "side", angles_deg, float(grip_raw),
+                    agent_bgr = inference_overlay.apply(
+                        agent_bgr, "side", angles_deg, float(grip_raw),
                         raw_L, raw_R,
                     )
-                    wrist_rgb = inference_overlay.apply(
-                        wrist_rgb, "wrist", angles_deg, float(grip_raw),
+                    wrist_bgr = inference_overlay.apply(
+                        wrist_bgr, "wrist", angles_deg, float(grip_raw),
                         raw_L, raw_R,
                     )
 
@@ -974,9 +1005,14 @@ def run(cfg: XArmInferenceConfig) -> None:
                         home_xyz = np.array(home_tcp_mm_deg[:3], dtype=np.float32) / 1000.0
                         home_aa = Rot.from_euler("xyz", home_tcp_mm_deg[3:], degrees=True).as_rotvec().astype(np.float32)
                         state = np.concatenate([home_xyz, home_aa, [0.0, 0.0]]).astype(np.float32)
+                    # The keys say "image" / "wrist_image" but the bytes are
+                    # BGR-ordered — that exactly matches what the training
+                    # pipeline stored (BGR captured + saved by PIL as
+                    # RGB-labeled PNGs, then loaded back as RGB tensors with
+                    # the same bytes). See InferenceOverlay class docstring.
                     obs = {
-                        "observation/image": agent_rgb,
-                        "observation/wrist_image": wrist_rgb,
+                        "observation/image": agent_bgr,
+                        "observation/wrist_image": wrist_bgr,
                         "observation/state": state,
                         "prompt": cfg.prompt,
                     }
@@ -992,15 +1028,15 @@ def run(cfg: XArmInferenceConfig) -> None:
                 if robot is not None:
                     robot.execute_delta(action)
                 if video is not None:
-                    video.write(agent_rgb, wrist_rgb)
+                    video.write(agent_bgr, wrist_bgr)
                 if viz is not None:
                     # Arm state + tactile already fetched at the top of this
                     # tick (need_arm_tactile is True whenever viz is on). Note:
-                    # if InferenceOverlay is also on, agent_rgb/wrist_rgb here
+                    # if InferenceOverlay is also on, agent_bgr/wrist_bgr here
                     # already have the policy-input overlay drawn — viz will
                     # show the same image the policy is seeing. That's the
                     # intended behavior (visualizes the actual policy input).
-                    viz.update(agent_rgb, wrist_rgb, angles_deg, float(grip_raw), raw_L, raw_R)
+                    viz.update(agent_bgr, wrist_bgr, angles_deg, float(grip_raw), raw_L, raw_R)
 
                 elapsed = time.time() - t0
                 if elapsed < dt:
@@ -1113,6 +1149,12 @@ def parse_args() -> XArmInferenceConfig:
                         "npz. Leave unset to use the one baked in (which "
                         "matches the training render).")
 
+    p.add_argument("--seed", type=int, default=None,
+                   help="Flow-matching sampler seed. Default (unset) draws a "
+                        "fresh seed from os.urandom on every launch, so each "
+                        "rollout sees a different noise sequence. Pin an int "
+                        "to reproduce a specific rollout (logged at startup).")
+
     args = p.parse_args()
 
     return XArmInferenceConfig(
@@ -1145,6 +1187,7 @@ def parse_args() -> XArmInferenceConfig:
         viz_mode_key=args.viz_mode_key,
         overlay_stats_path=args.overlay_stats,
         overlay_mode_key=args.overlay_mode_key,
+        seed=args.seed,
     )
 
 

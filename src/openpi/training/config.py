@@ -893,6 +893,58 @@ _CONFIGS = [
             ("pi05_xarm_tube_arrow_lora", "local/xarm_tube_arrow"),
         ]
     ],
+    # Four-task xArm LoRA finetunes against the *_points1_arrow overlay
+    # variant produced by the newer phone_data_collection renderer. Same
+    # hyperparameters and freeze-filter as the cube/tube arrow_lora pair
+    # above; repo_id matches the asset_id baked into each checkpoint's
+    # assets/local/<repo_id>/norm_stats.json. These checkpoints live under
+    # checkpoints/pi05_xarm_{task}_points1_arrow_lora/.
+    *[
+        TrainConfig(
+            name=name,
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
+            data=LeRobotLiberoDataConfig(
+                repo_id=repo_id,
+                base_config=DataConfig(prompt_from_task=True),
+                extra_delta_transform=False,
+            ),
+            batch_size=8,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=500,
+                peak_lr=1e-4,
+                decay_steps=20_000,
+                decay_lr=1e-5,
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=None,
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_droid/params"
+            ),
+            freeze_filter=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),
+            num_train_steps=20_000,
+            save_interval=2_000,
+            early_stop_enabled=True,
+            wandb_enabled=False,
+        )
+        for name, repo_id in [
+            ("pi05_xarm_cube_points1_arrow_lora",       "local/xarm_cube_points1_arrow"),
+            ("pi05_xarm_charger_points1_arrow_lora",    "local/xarm_charger_points1_arrow"),
+            ("pi05_xarm_dishwasher_points1_arrow_lora", "local/xarm_dishwasher_points1_arrow"),
+            ("pi05_xarm_tube_points1_arrow_lora",       "local/xarm_tube_points1_arrow"),
+        ]
+    ],
     # LoRA variant of pi05_libero_finetune — fits on a single GPU (>22.5 GB). Starts from
     # pi05_libero, freezes base weights, only LoRA adapters are trained.
     TrainConfig(
