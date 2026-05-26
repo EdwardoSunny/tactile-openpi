@@ -59,6 +59,10 @@ DEFAULT_ARROW_LENGTH_SCALE = {
     "points9_color_spatial": 0.12,
     "points1_contact_flat": 0.12,
     "points9_color_flat": 0.12,
+    # bin_bar uses a different rendering parameter (bar_scale=300 px/unit,
+    # baked into draw_sensors.py); arrow_length_scale is unused for this
+    # mode but the value is kept here so --mode bin_bar is accepted.
+    "bin_bar": 0.12,
 }
 # Match BOLD_ARROW_THICKNESS / BOLD_DOT_SIZE in
 # phone_data_collection/environment/tactile_overlay.py used by the renderer.
