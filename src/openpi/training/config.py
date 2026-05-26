@@ -940,9 +940,64 @@ _CONFIGS = [
         )
         for name, repo_id in [
             ("pi05_xarm_cube_points1_arrow_lora",       "local/xarm_cube_points1_arrow"),
+            ("pi05_xarm_tube_points1_arrow_lora",       "local/xarm_tube_points1_arrow"),
             ("pi05_xarm_charger_points1_arrow_lora",    "local/xarm_charger_points1_arrow"),
             ("pi05_xarm_dishwasher_points1_arrow_lora", "local/xarm_dishwasher_points1_arrow"),
-            ("pi05_xarm_tube_points1_arrow_lora",       "local/xarm_tube_points1_arrow"),
+        ]
+    ],
+    # Phase-2 ablation: points9_arrow overlay (9 force arrows per finger) + raw baseline
+    # (no overlay). 8 configs total — same hyperparameters / weight init / early-stop /
+    # wandb-off as the points1_arrow block above. The _baseline_lora entries are explicitly
+    # named to distinguish them from the legacy pi05_xarm_{cube,tube}_raw_lora configs that
+    # use a different repo_id naming scheme (local/xarm_<task> without the _raw suffix).
+    *[
+        TrainConfig(
+            name=name,
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
+            data=LeRobotLiberoDataConfig(
+                repo_id=repo_id,
+                base_config=DataConfig(prompt_from_task=True),
+                extra_delta_transform=False,
+            ),
+            batch_size=8,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=500,
+                peak_lr=1e-4,
+                decay_steps=20_000,
+                decay_lr=1e-5,
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=None,
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_droid/params"
+            ),
+            freeze_filter=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),
+            num_train_steps=20_000,
+            save_interval=2_000,
+            early_stop_enabled=True,
+            wandb_enabled=False,
+        )
+        for name, repo_id in [
+            ("pi05_xarm_cube_points9_arrow_lora",       "local/xarm_cube_points9_arrow"),
+            ("pi05_xarm_tube_points9_arrow_lora",       "local/xarm_tube_points9_arrow"),
+            ("pi05_xarm_charger_points9_arrow_lora",    "local/xarm_charger_points9_arrow"),
+            ("pi05_xarm_dishwasher_points9_arrow_lora", "local/xarm_dishwasher_points9_arrow"),
+            ("pi05_xarm_cube_baseline_lora",            "local/xarm_cube_raw"),
+            ("pi05_xarm_tube_baseline_lora",            "local/xarm_tube_raw"),
+            ("pi05_xarm_charger_baseline_lora",         "local/xarm_charger_raw"),
+            ("pi05_xarm_dishwasher_baseline_lora",      "local/xarm_dishwasher_raw"),
         ]
     ],
     # LoRA variant of pi05_libero_finetune — fits on a single GPU (>22.5 GB). Starts from

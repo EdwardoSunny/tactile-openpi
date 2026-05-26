@@ -133,6 +133,9 @@ def _count_leading_paused(tcp: np.ndarray) -> int:
 
 
 def _float01_to_uint8(img_f: np.ndarray) -> np.ndarray:
+    # Newer renderer writes uint8 images directly; legacy renderer wrote float32 in [0, 1].
+    if img_f.dtype == np.uint8:
+        return img_f
     return np.clip(img_f * 255.0, 0, 255).astype(np.uint8)
 
 
