@@ -55,15 +55,24 @@ Tactile gripper safety (mandatory):
     "next tick try to slam to 0 again".
 
 Tactile arrow overlay (matches training-time `img_{0,1}_points1_arrow` etc.):
-    Pass `--overlay-stats <path/to/overlay_norm.npz>` to enable. The npz is
-    produced by `examples/xarm/inference/extract_overlay_norm.py` from the
-    same training overlay zarrs (which embed /meta/normalization written by
-    phone_data_collection's compute_overlay_normalization.py). When the flag
-    is set, every camera frame fed to the policy is overlay-rendered with
-    the SAME pipeline used at training (Hampel raw clip + per-rollout
-    baseline subtract + cross-task pooled scales + adaptive deadband + the
-    chosen overlay variant via sensordrawing). Without it, raw frames are
-    sent (only correct for checkpoints trained on raw img_0/img_1).
+    Easy path — `--overlay <mode>`:
+        Use the bundled pooled npz for that mode. Resolves to
+        `examples/xarm/inference/overlay_norm_<mode>.npz`. ONE file works for
+        all 4 tasks because scale_xy/scale_z/deadband are identical across
+        tasks (they were computed jointly by phone_data_collection's
+        compute_overlay_normalization.py over all task zarrs); only raw_clip
+        bounds differ, and the pooled file uses the union (elementwise
+        min/max) which is the most permissive correct choice.
+        Example: --overlay points9_arrow
+
+    Power-user path — `--overlay-stats <path>` (+ optional `--overlay-mode-key`):
+        Explicit path to any overlay_norm.npz (e.g. a per-task variant
+        you produced yourself with extract_overlay_norm.py). Use this if
+        you have task-specific clip bounds you want to honor exactly.
+
+    Without either flag, raw frames are sent to the policy — only correct
+    for checkpoints trained on raw img_0/img_1 (the *_baseline_lora
+    configs).
 """
 
 from __future__ import annotations
@@ -1135,19 +1144,28 @@ def parse_args() -> XArmInferenceConfig:
                         "legacy 'arrow' overlay is 'points1_arrow').")
 
     # Policy-input tactile overlay — eliminates the raw-vs-overlay distribution
-    # shift between training and inference. The npz is produced by
-    # examples/xarm/inference/extract_overlay_norm.py from the same overlay
-    # zarrs you trained on.
+    # shift between training and inference.
+    p.add_argument("--overlay", type=str, default=None, metavar="MODE",
+                   help="Shortcut: use the bundled pooled overlay npz for "
+                        "this mode (e.g. 'points9_arrow' or 'points1_arrow'). "
+                        "Resolves to examples/xarm/inference/overlay_norm_<MODE>.npz "
+                        "and uses MODE as the renderer mode_key. The bundled "
+                        "files pool stats across all 4 task zarrs and work "
+                        "for any task — no per-task file needed. "
+                        "Mutually exclusive with --overlay-stats.")
     p.add_argument("--overlay-stats", type=str, default=None,
-                   help="Path to overlay_norm.npz (from extract_overlay_norm.py). "
-                        "When set, every camera frame fed to the policy is "
-                        "overlaid using the SAME normalization the training "
-                        "data was rendered with. When unset, raw frames are "
-                        "sent (only correct for raw-trained checkpoints).")
+                   help="Power-user override: explicit path to any "
+                        "overlay_norm.npz (from extract_overlay_norm.py). "
+                        "Use this if you want a per-task variant instead of "
+                        "the bundled pooled file. Prefer --overlay for the "
+                        "common case. When unset (and --overlay also unset), "
+                        "raw frames are sent (only correct for "
+                        "*_baseline_lora checkpoints).")
     p.add_argument("--overlay-mode-key", type=str, default=None,
-                   help="Override the mode_key stored inside the overlay-stats "
-                        "npz. Leave unset to use the one baked in (which "
-                        "matches the training render).")
+                   help="Override the mode_key stored inside the --overlay-stats "
+                        "npz. Ignored when --overlay is used (the mode is "
+                        "taken from the --overlay value). Leave unset to use "
+                        "the value baked into the npz (matches training).")
 
     p.add_argument("--seed", type=int, default=None,
                    help="Flow-matching sampler seed. Default (unset) draws a "
@@ -1156,6 +1174,31 @@ def parse_args() -> XArmInferenceConfig:
                         "to reproduce a specific rollout (logged at startup).")
 
     args = p.parse_args()
+
+    # Resolve --overlay shortcut into (overlay_stats_path, overlay_mode_key).
+    overlay_stats_path = args.overlay_stats
+    overlay_mode_key = args.overlay_mode_key
+    if args.overlay is not None:
+        if args.overlay_stats is not None:
+            raise SystemExit(
+                "Pass either --overlay <MODE> or --overlay-stats <PATH>, "
+                "not both. --overlay is the easy path (bundled pooled "
+                "npz); --overlay-stats is the explicit-path override."
+            )
+        script_dir = Path(__file__).resolve().parent
+        inferred_path = script_dir / f"overlay_norm_{args.overlay}.npz"
+        if not inferred_path.is_file():
+            raise SystemExit(
+                f"--overlay {args.overlay!r} expected the bundled npz at "
+                f"{inferred_path}, but it does not exist. Either run "
+                f"extract_overlay_norm.py to produce it, or pass an "
+                f"explicit --overlay-stats <path>."
+            )
+        overlay_stats_path = str(inferred_path)
+        # Use the requested mode as the renderer mode_key (overrides
+        # whatever is baked into the npz — usually identical anyway since
+        # the pooled file's mode_key matches the --overlay value).
+        overlay_mode_key = args.overlay
 
     return XArmInferenceConfig(
         checkpoint=args.checkpoint,
@@ -1185,8 +1228,8 @@ def parse_args() -> XArmInferenceConfig:
         show_windows=args.show_windows,
         viz_overlay_repo=args.viz_overlay_repo,
         viz_mode_key=args.viz_mode_key,
-        overlay_stats_path=args.overlay_stats,
-        overlay_mode_key=args.overlay_mode_key,
+        overlay_stats_path=overlay_stats_path,
+        overlay_mode_key=overlay_mode_key,
         seed=args.seed,
     )
 

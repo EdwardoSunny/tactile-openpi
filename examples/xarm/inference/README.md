@@ -367,9 +367,37 @@ If you want to route through the ril_env wrapper anyway, pre-divide the 6-D delt
 
 ## Tactile arrow overlay
 
-`apply_tactile_overlay(img, tactile_reading)` is a stub that currently returns the image unchanged. The dataset we trained on had `n_contacts` all-zero, so no arrows were drawn at training time — the policy effectively learned on plain camera frames, and identity at inference is correct for **this** checkpoint.
+Checkpoints trained on overlaid frames (`pi05_xarm_<task>_points{1,9}_arrow_lora`) need the **same** overlay rendered onto live camera frames at inference. Without it, the deployment pixel distribution diverges from training and the policy goes out of distribution.
 
-For future retraining on data with real tactile contacts, fill this hook in with the same renderer used at collection. Otherwise the deployment pixel distribution diverges from training and the policy will fall out of distribution.
+### Easy path — `--overlay <mode>` (recommended)
+
+```
+--overlay points9_arrow      # for a points9 checkpoint
+--overlay points1_arrow      # for a points1 checkpoint
+```
+
+That's it. The flag resolves to the bundled `examples/xarm/inference/overlay_norm_<mode>.npz` and uses `<mode>` as the renderer's mode_key. **One npz works for all 4 tasks** — `scale_xy` / `scale_z` / `deadband` are identical across tasks (computed jointly across the 4 task zarrs by `phone_data_collection/scripts/compute_overlay_normalization.py`); only `raw_clip_low/high` differ, and the bundled file uses the elementwise union so it's the most permissive correct bound.
+
+For `*_baseline_lora` checkpoints (trained on raw frames, no overlay), **omit** the flag.
+
+### Power-user path — `--overlay-stats <path>` (+ optional `--overlay-mode-key`)
+
+If you have a per-task `overlay_norm.npz` you produced yourself with `extract_overlay_norm.py` (one zarr in, tighter clip bounds), pass it explicitly. Mutually exclusive with `--overlay`.
+
+### Re-generating the bundled npz
+
+If the data collection re-runs, refresh the bundled files:
+
+```bash
+./.venv/bin/python examples/xarm/inference/extract_overlay_norm.py \
+    /path/to/teleop_data_cube_overlay.zarr \
+    /path/to/teleop_data_tube_overlay.zarr \
+    /path/to/teleop_data_charger_overlay.zarr \
+    /path/to/teleop_data_dishwasher_overlay.zarr \
+    --mode points9_arrow \
+    --out examples/xarm/inference/overlay_norm_points9.npz
+# repeat with --mode points1_arrow --out overlay_norm_points1.npz
+```
 
 ## What gets transferred (and what doesn't)
 
