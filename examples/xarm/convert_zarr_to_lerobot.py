@@ -71,6 +71,7 @@ _OVERLAY_MODES = (
     "raw",
     "arrow", "grid", "point", "bar",                 # legacy renderer
     "points1_arrow", "points9_arrow",                # new renderer (preferred)
+    "bin_bar",                                       # current canonical (alpha-blended horizontal bar per finger)
     "points1_contact_flat", "points1_contact_spatial",
     "points9_color_flat", "points9_color_spatial",
 )
