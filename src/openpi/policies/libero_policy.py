@@ -84,6 +84,49 @@ class LiberoInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class LiberoManifeelInputs(transforms.DataTransformFn):
+    """Variant of LiberoInputs that fills the third image slot with a
+    pre-rendered tactile visualization ("manifeel" baseline).
+
+    Dataset must contain `observation/tactile_image` (224x224x3 uint8),
+    produced by examples/xarm/convert_zarr_to_lerobot.py with
+    --add-third-image. The agent + wrist camera images are passed through
+    unchanged (no overlay); the tactile_image is packed into
+    `right_wrist_0_rgb` with image_mask=True so the model actually
+    attends to it (unlike the zero-padded version in LiberoInputs).
+    """
+
+    model_type: _model.ModelType
+
+    def __call__(self, data: dict) -> dict:
+        base_image = _parse_image(data["observation/image"])
+        wrist_image = _parse_image(data["observation/wrist_image"])
+        tactile_image = _parse_image(data["observation/tactile_image"])
+
+        inputs = {
+            "state": data["observation/state"],
+            "image": {
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": wrist_image,
+                # Third image: tactile sensor visualization.
+                "right_wrist_0_rgb": tactile_image,
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                # Enabled (the tactile_image is real, not zero padding).
+                "right_wrist_0_rgb": np.True_,
+            },
+        }
+
+        if "actions" in data:
+            inputs["actions"] = data["actions"]
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
 class LiberoOutputs(transforms.DataTransformFn):
     """
     This class is used to convert outputs from the model back the the dataset specific format. It is

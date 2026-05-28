@@ -89,6 +89,15 @@ class Args:
     mode: str = "arrow"
     # If True, skip episodes with no grasp open->close transition (operator forgot to grasp).
     require_grasp_transition: bool = True
+    # If True, ALSO render a per-frame "third_image" (224x224 tactile-only
+    # visualization via sensordrawing's third_image mode) and store as a
+    # new LeRobot feature `tactile_image`. The agent/wrist camera images
+    # (img_0/img_1) are unchanged by this flag — use --mode raw to keep
+    # them un-overlaid (this is the "manifeel baseline" recipe).
+    add_third_image: bool = False
+    # Path to tactile-data-collection (provides the vendored sensordrawing
+    # used to render third_image). Only used when add_third_image=True.
+    tactile_data_collection_repo: Path = Path("/home/edwardosunny/tactile-data-collection")
 
 
 def _pick_image_key(g: zarr.Group, cam_idx: int, mode: str) -> str:
@@ -140,6 +149,57 @@ def _float01_to_uint8(img_f: np.ndarray) -> np.ndarray:
     return np.clip(img_f * 255.0, 0, 255).astype(np.uint8)
 
 
+def _build_third_image_renderer(args: Args, g: zarr.Group):
+    """Returns (renderer_fn, norm_fn) for per-frame third_image rendering.
+
+    renderer_fn(normalized_L_9x3, normalized_R_9x3) -> (224, 224, 3) BGR uint8
+    norm_fn(raw_tactile_2x9x3) -> (normalized_L_9x3, normalized_R_9x3) using
+    the same (baseline, scale, deadband) the training-time renderer used —
+    extracted from /meta/normalization and /meta/tactile_baseline in the
+    overlay zarr.
+    """
+    import sys as _sys
+    repo = str(args.tactile_data_collection_repo)
+    if repo not in _sys.path:
+        _sys.path.insert(0, repo)
+    from environment.sensordrawing import SensorDrawer  # type: ignore
+
+    # Per-finger normalization knobs (same as the training-time renderer).
+    baseline = np.asarray(g["meta/tactile_baseline"][:], dtype=np.float32)        # (2, 9, 3)
+    scale_xy = np.asarray(g["meta/normalization/scale_xy"][:], dtype=np.float32)  # (2,)
+    scale_z  = np.asarray(g["meta/normalization/scale_z"][:],  dtype=np.float32)  # (2,)
+    deadband = float(np.asarray(g["meta/normalization/deadband"][...]))
+
+    sd = SensorDrawer(camera_select="side")  # third_image ignores camera intrinsics
+
+    def normalize(raw_2x9x3: np.ndarray):
+        d = (raw_2x9x3.astype(np.float32) - baseline)
+        d[..., 0] /= scale_xy.reshape(2, 1)
+        d[..., 1] /= scale_xy.reshape(2, 1)
+        d[..., 2] /= scale_z.reshape(2, 1)
+        mag_xy = np.linalg.norm(d[..., :2], axis=-1)
+        d[..., 0] = np.where(mag_xy >= deadband, d[..., 0], 0.0)
+        d[..., 1] = np.where(mag_xy >= deadband, d[..., 1], 0.0)
+        # third_image expects x,y in [-1,1] and z in [0,1]
+        d[..., :2] = np.clip(d[..., :2], -1.0, 1.0)
+        d[..., 2]  = np.clip(d[..., 2],  0.0, 1.0)
+        return d[0], d[1]
+
+    blank = np.zeros((224, 224, 3), dtype=np.uint8)
+    angles_stub = [0.0] * 7
+    grip_stub = 850.0
+
+    def render(raw_2x9x3: np.ndarray) -> np.ndarray:
+        nL, nR = normalize(raw_2x9x3)
+        return sd.draw_on_image(
+            blank, angles_stub, grip_stub,
+            normalized_left_sensor=nL, normalized_right_sensor=nR,
+            mode="third_image",
+        )
+
+    return render
+
+
 def main(args: Args) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     g = zarr.open(str(args.zarr), mode="r")
@@ -149,21 +209,32 @@ def main(args: Args) -> None:
     logger.info("zarr=%s, mode=%s, episodes=%d, image keys: %s, %s",
                 args.zarr, args.mode, len(ep_ends), img0_key, img1_key)
 
+    render_third = None
+    if args.add_third_image:
+        if "data/tactile" not in g or "meta/tactile_baseline" not in g:
+            raise KeyError("--add-third-image requires data/tactile + meta/tactile_baseline in the zarr.")
+        render_third = _build_third_image_renderer(args, g)
+        logger.info("third_image rendering enabled — adding LeRobot feature 'tactile_image'")
+
     out_path = HF_LEROBOT_HOME / args.repo_id
     if out_path.exists():
         logger.info("Removing existing LeRobot dataset at %s", out_path)
         shutil.rmtree(out_path)
 
+    features = {
+        "image": {"dtype": "image", "shape": (224, 224, 3), "names": ["height", "width", "channel"]},
+        "wrist_image": {"dtype": "image", "shape": (224, 224, 3), "names": ["height", "width", "channel"]},
+        "state": {"dtype": "float32", "shape": (8,), "names": ["state"]},
+        "actions": {"dtype": "float32", "shape": (7,), "names": ["actions"]},
+    }
+    if render_third is not None:
+        features["tactile_image"] = {"dtype": "image", "shape": (224, 224, 3), "names": ["height", "width", "channel"]}
+
     dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
         robot_type="xarm",
         fps=CONTROL_HZ,
-        features={
-            "image": {"dtype": "image", "shape": (224, 224, 3), "names": ["height", "width", "channel"]},
-            "wrist_image": {"dtype": "image", "shape": (224, 224, 3), "names": ["height", "width", "channel"]},
-            "state": {"dtype": "float32", "shape": (8,), "names": ["state"]},
-            "actions": {"dtype": "float32", "shape": (7,), "names": ["actions"]},
-        },
+        features=features,
         image_writer_threads=10,
         image_writer_processes=5,
     )
@@ -175,6 +246,7 @@ def main(args: Args) -> None:
         state = np.asarray(g["data/state"][ep_start:ep_end], dtype=np.float32)
         img_a = np.asarray(g[img0_key][ep_start:ep_end])
         img_w = np.asarray(g[img1_key][ep_start:ep_end])
+        tactile_ep = np.asarray(g["data/tactile"][ep_start:ep_end], dtype=np.float32) if render_third is not None else None
         ep_start = ep_end
 
         tcp = state[:, :6]
@@ -182,7 +254,10 @@ def main(args: Args) -> None:
 
         n_lead = _count_leading_paused(tcp)
         if n_lead > 0:
-            tcp, grasp, img_a, img_w = tcp[n_lead:], grasp[n_lead:], img_a[n_lead:], img_w[n_lead:]
+            tcp, grasp = tcp[n_lead:], grasp[n_lead:]
+            img_a, img_w = img_a[n_lead:], img_w[n_lead:]
+            if tactile_ep is not None:
+                tactile_ep = tactile_ep[n_lead:]
 
         if len(tcp) < 5:
             logger.warning("episode %d: only %d steps after trim; skipping", ep_idx, len(tcp))
@@ -209,16 +284,22 @@ def main(args: Args) -> None:
         agentview = _float01_to_uint8(img_a[:-1])
         wrist = _float01_to_uint8(img_w[:-1])
 
+        # Pre-render the third_image for this episode (uses tactile of the SAME
+        # frame as the camera images — drops the last frame to match actions).
+        if render_third is not None:
+            third = np.stack([render_third(tactile_ep[t]) for t in range(actions.shape[0])], axis=0)
+
         for t in range(actions.shape[0]):
-            dataset.add_frame(
-                {
-                    "image": agentview[t],
-                    "wrist_image": wrist[t],
-                    "state": obs_state[t],
-                    "actions": actions[t],
-                    "task": args.language,
-                }
-            )
+            frame = {
+                "image": agentview[t],
+                "wrist_image": wrist[t],
+                "state": obs_state[t],
+                "actions": actions[t],
+                "task": args.language,
+            }
+            if render_third is not None:
+                frame["tactile_image"] = third[t]
+            dataset.add_frame(frame)
         dataset.save_episode()
         n_written += 1
         n_frames += int(actions.shape[0])

@@ -73,6 +73,20 @@ Tactile arrow overlay (matches training-time `img_{0,1}_points1_arrow` etc.):
     Without either flag, raw frames are sent to the policy — only correct
     for checkpoints trained on raw img_0/img_1 (the *_baseline_lora
     configs).
+
+Manifeel inference path (`pi05_xarm_<task>_manifeel_baseline_lora`):
+    Pass `--manifeel`. Camera frames are NOT modified; instead a synthetic
+    tactile-only image (sensordrawing "third_image" mode — two 3x3 arrow
+    grids on black, color=z normal force, direction=xy shear) is rendered
+    per tick from live tactile readings and packed as
+    `observation/tactile_image`. LiberoManifeelInputs slots that into
+    right_wrist_0_rgb with image_mask=True, so the model sees:
+        - agent camera (raw)
+        - wrist camera (raw)
+        - tactile third_image (synthetic, this tick's tactile)
+    matching exactly what the training pipeline produced. Video recording
+    switches to 3-up (agent | wrist | manifeel). Mutually exclusive with
+    --overlay / --overlay-stats.
 """
 
 from __future__ import annotations
@@ -210,6 +224,15 @@ class XArmInferenceConfig:
     # if you want to render a different variant than the one extract_overlay_norm.py
     # baked in (rare; normally leave it None to match training).
     overlay_mode_key: str | None = None
+    # Manifeel mode: agent + wrist camera frames are NOT modified; a synthetic
+    # tactile-only image (sensordrawing third_image) is rendered per-tick and
+    # passed as observation/tactile_image. Mutually exclusive with overlay_*
+    # paths. For pi05_xarm_<task>_manifeel_baseline_lora checkpoints.
+    manifeel: bool = False
+    # Path to the manifeel overlay-norm npz (used for scale_xy/scale_z/deadband
+    # only; the actual rendering mode is hardcoded to sensordrawing "third_image"
+    # in ManifeelRenderer).
+    manifeel_stats_path: str | None = None
 
     # Flow-matching sampler seed. None -> derive from wall clock + os.urandom so
     # each fresh launch gets a different noise sequence (and therefore a
@@ -767,10 +790,12 @@ class VideoRecorder:
         self.path = path
         log.info("Recording rollout to %s", path)
 
-    def write(self, agent_bgr: np.ndarray, wrist_bgr: np.ndarray) -> None:
+    def write(self, *images_bgr: np.ndarray) -> None:
         # Inputs are already BGR (matches training-time channel order);
         # cv2.VideoWriter also expects BGR, so no conversion needed.
-        frame = np.concatenate([agent_bgr, wrist_bgr], axis=1)
+        # Pass 2 images for the overlay path (agent | wrist) or 3 for the
+        # manifeel path (agent | wrist | manifeel third_image).
+        frame = np.concatenate(images_bgr, axis=1)
         self.writer.write(frame)
 
     def close(self) -> None:
@@ -899,8 +924,11 @@ def run(cfg: XArmInferenceConfig) -> None:
 
         cams = CameraManager(cfg)
         robot = None if cfg.dry_run else XArmController(cfg, tactile=tactile)
+        # 3-up video for manifeel mode (agent | wrist | manifeel third_image),
+        # otherwise the standard 2-up (agent | wrist).
+        n_video_panels = 3 if cfg.manifeel else 2
         video = (
-            VideoRecorder(cfg.video_path, cfg.control_hz, (cfg.image_size * 2, cfg.image_size))
+            VideoRecorder(cfg.video_path, cfg.control_hz, (cfg.image_size * n_video_panels, cfg.image_size))
             if cfg.save_video else None
         )
 
@@ -919,7 +947,30 @@ def run(cfg: XArmInferenceConfig) -> None:
         # normalize + deadband + draw). The same `baseline` we just captured
         # serves as the per-rollout offset (= per-episode offset at training).
         inference_overlay = None
-        if cfg.overlay_stats_path:
+        manifeel_renderer = None
+        if cfg.manifeel:
+            # Manifeel inference path: do NOT modify camera frames. Render a
+            # separate tactile-only image (sensordrawing "third_image") per
+            # tick and pack it as observation/tactile_image so the model's
+            # third image slot is fed with the same content it saw at
+            # training time (right_wrist_0_rgb / image_mask=True).
+            from inference_overlay import ManifeelRenderer  # local sibling file
+            manifeel_renderer = ManifeelRenderer(
+                stats_path=cfg.manifeel_stats_path,
+                phone_data_collection_repo=cfg.viz_overlay_repo,
+                baseline=baseline,
+                out_size=cfg.image_size,
+            )
+            log.info(
+                "ManifeelRenderer enabled: scale_xy=[%.1f, %.1f], "
+                "scale_z=[%.1f, %.1f], deadband=%.4f, out_size=%d. "
+                "Camera frames will be sent RAW; tactile flows in as the "
+                "third image slot (observation/tactile_image).",
+                float(manifeel_renderer.scale_xy[0]), float(manifeel_renderer.scale_xy[1]),
+                float(manifeel_renderer.scale_z[0]), float(manifeel_renderer.scale_z[1]),
+                manifeel_renderer.deadband, cfg.image_size,
+            )
+        elif cfg.overlay_stats_path:
             from inference_overlay import InferenceOverlay  # local sibling file
             inference_overlay = InferenceOverlay(
                 stats_path=cfg.overlay_stats_path,
@@ -937,9 +988,10 @@ def run(cfg: XArmInferenceConfig) -> None:
             )
         else:
             log.warning(
-                "No --overlay-stats provided. Camera frames sent to the policy "
-                "will be RAW. Only correct if the checkpoint was trained on raw "
-                "(no-overlay) frames; otherwise expect a distribution shift."
+                "No --overlay-stats / --overlay / --manifeel provided. Camera "
+                "frames sent to the policy will be RAW. Only correct if the "
+                "checkpoint was trained on raw (no-overlay) frames; otherwise "
+                "expect a distribution shift."
             )
 
         if cfg.show_windows:
@@ -1003,6 +1055,12 @@ def run(cfg: XArmInferenceConfig) -> None:
                         raw_L, raw_R,
                     )
 
+                # Manifeel: agent/wrist stay raw; render the synthetic
+                # tactile-only image to feed as the third image slot.
+                manifeel_bgr = None
+                if manifeel_renderer is not None:
+                    manifeel_bgr = manifeel_renderer.render(raw_L, raw_R)
+
                 if not action_plan:
                     if robot is not None:
                         state = robot.get_state_8dim()
@@ -1025,6 +1083,10 @@ def run(cfg: XArmInferenceConfig) -> None:
                         "observation/state": state,
                         "prompt": cfg.prompt,
                     }
+                    if manifeel_bgr is not None:
+                        # Third image slot. LiberoManifeelInputs reads this
+                        # and packs it into right_wrist_0_rgb with mask=True.
+                        obs["observation/tactile_image"] = manifeel_bgr
                     chunk = np.asarray(policy.infer(obs)["actions"])  # (10, 7)
                     if chunk.shape[0] < cfg.replan_steps:
                         raise RuntimeError(f"Action chunk too short: {chunk.shape}")
@@ -1037,7 +1099,12 @@ def run(cfg: XArmInferenceConfig) -> None:
                 if robot is not None:
                     robot.execute_delta(action)
                 if video is not None:
-                    video.write(agent_bgr, wrist_bgr)
+                    if manifeel_bgr is not None:
+                        # 3-up: agent | wrist | manifeel third_image —
+                        # exactly the three images the model sees.
+                        video.write(agent_bgr, wrist_bgr, manifeel_bgr)
+                    else:
+                        video.write(agent_bgr, wrist_bgr)
                 if viz is not None:
                     # Arm state + tactile already fetched at the top of this
                     # tick (need_arm_tactile is True whenever viz is on). Note:
@@ -1166,6 +1233,23 @@ def parse_args() -> XArmInferenceConfig:
                         "npz. Ignored when --overlay is used (the mode is "
                         "taken from the --overlay value). Leave unset to use "
                         "the value baked into the npz (matches training).")
+    p.add_argument("--manifeel", action="store_true",
+                   help="Enable manifeel inference path for pi05_xarm_<task>_"
+                        "manifeel_baseline_lora checkpoints. Agent + wrist "
+                        "camera frames are left RAW (no overlay drawn on them); "
+                        "instead, a synthetic tactile-only image is rendered "
+                        "from live tactile readings (sensordrawing 'third_image' "
+                        "mode) and packed as observation/tactile_image for "
+                        "the third image slot (right_wrist_0_rgb with mask=True). "
+                        "Video recording switches to 3-up (agent | wrist | "
+                        "manifeel). Mutually exclusive with --overlay / "
+                        "--overlay-stats.")
+    p.add_argument("--manifeel-stats", type=str,
+                   default="examples/xarm/inference/overlay_norm_manifeel.npz",
+                   help="Path to the manifeel overlay-norm npz (used only for "
+                        "scale_xy/scale_z/deadband; the rendering mode is "
+                        "hardcoded to sensordrawing's 'third_image'). Default "
+                        "is the bundled pooled npz.")
 
     p.add_argument("--seed", type=int, default=None,
                    help="Flow-matching sampler seed. Default (unset) draws a "
@@ -1200,6 +1284,23 @@ def parse_args() -> XArmInferenceConfig:
         # the pooled file's mode_key matches the --overlay value).
         overlay_mode_key = args.overlay
 
+    # Manifeel mode: disables the overlay-on-camera path. The two flags are
+    # mutually exclusive — manifeel sends a SEPARATE tactile image as obs
+    # rather than overlaying onto the existing camera frames.
+    if args.manifeel:
+        if args.overlay is not None or args.overlay_stats is not None:
+            raise SystemExit(
+                "--manifeel is mutually exclusive with --overlay / "
+                "--overlay-stats. The manifeel path keeps camera frames RAW "
+                "and adds a separate tactile image to the obs dict."
+            )
+        if not Path(args.manifeel_stats).is_file():
+            raise SystemExit(
+                f"--manifeel-stats {args.manifeel_stats!r} not found. The "
+                f"default bundled path is examples/xarm/inference/"
+                f"overlay_norm_manifeel.npz."
+            )
+
     return XArmInferenceConfig(
         checkpoint=args.checkpoint,
         train_config_name=args.train_config_name,
@@ -1230,6 +1331,8 @@ def parse_args() -> XArmInferenceConfig:
         viz_mode_key=args.viz_mode_key,
         overlay_stats_path=overlay_stats_path,
         overlay_mode_key=overlay_mode_key,
+        manifeel=args.manifeel,
+        manifeel_stats_path=args.manifeel_stats if args.manifeel else None,
         seed=args.seed,
     )
 

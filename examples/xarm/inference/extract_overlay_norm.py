@@ -63,6 +63,11 @@ DEFAULT_ARROW_LENGTH_SCALE = {
     # baked into draw_sensors.py); arrow_length_scale is unused for this
     # mode but the value is kept here so --mode bin_bar is accepted.
     "bin_bar": 0.12,
+    # manifeel: ManifeelRenderer always calls draw_on_image with mode=
+    # "third_image" — the per-cell arrow length is computed inside
+    # sensordrawing directly from normalized x,y. arrow_length_scale is
+    # unused; value here is just so --mode manifeel is accepted.
+    "manifeel": 0.12,
 }
 # Match BOLD_ARROW_THICKNESS / BOLD_DOT_SIZE in
 # phone_data_collection/environment/tactile_overlay.py used by the renderer.

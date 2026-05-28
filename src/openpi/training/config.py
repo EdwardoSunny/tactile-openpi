@@ -356,6 +356,46 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotLiberoManifeelDataConfig(DataConfigFactory):
+    """Variant of LeRobotLiberoDataConfig for the "manifeel baseline":
+    agent + wrist cameras stay raw (no overlay), and the pre-rendered
+    tactile third_image is fed in via the right_wrist_0_rgb slot using
+    LiberoManifeelInputs.
+
+    The LeRobot dataset must include a `tactile_image` feature, produced
+    by examples/xarm/convert_zarr_to_lerobot.py with --add-third-image.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/tactile_image": "tactile_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.LiberoManifeelInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -1048,6 +1088,57 @@ _CONFIGS = [
             ("pi05_xarm_tube_bin_bar_lora",       "local/xarm_tube_bin_bar"),
             ("pi05_xarm_charger_bin_bar_lora",    "local/xarm_charger_bin_bar"),
             ("pi05_xarm_dishwasher_bin_bar_lora", "local/xarm_dishwasher_bin_bar"),
+        ]
+    ],
+    # "manifeel baseline": agent + wrist cameras are RAW (no overlay), but a third
+    # camera slot (right_wrist_0_rgb) carries a pre-rendered tactile-only image
+    # (sensordrawing "third_image" mode — a 3x3 arrow grid per finger on a black
+    # background). The tactile signal flows through the model as an additional
+    # vision input rather than being burned onto the robot's camera frames. Uses
+    # LeRobotLiberoManifeelDataConfig + LiberoManifeelInputs.
+    *[
+        TrainConfig(
+            name=name,
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
+            data=LeRobotLiberoManifeelDataConfig(
+                repo_id=repo_id,
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            batch_size=8,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=500,
+                peak_lr=1e-4,
+                decay_steps=20_000,
+                decay_lr=1e-5,
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=None,
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_droid/params"
+            ),
+            freeze_filter=pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=10,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),
+            num_train_steps=20_000,
+            save_interval=2_000,
+            early_stop_enabled=True,
+            wandb_enabled=False,
+        )
+        for name, repo_id in [
+            ("pi05_xarm_cube_manifeel_baseline_lora",       "local/xarm_cube_manifeel_baseline"),
+            ("pi05_xarm_tube_manifeel_baseline_lora",       "local/xarm_tube_manifeel_baseline"),
+            ("pi05_xarm_charger_manifeel_baseline_lora",    "local/xarm_charger_manifeel_baseline"),
+            ("pi05_xarm_dishwasher_manifeel_baseline_lora", "local/xarm_dishwasher_manifeel_baseline"),
         ]
     ],
     # LoRA variant of pi05_libero_finetune — fits on a single GPU (>22.5 GB). Starts from
