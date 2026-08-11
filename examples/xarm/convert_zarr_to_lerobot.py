@@ -71,6 +71,8 @@ _OVERLAY_MODES = (
     "raw",
     "arrow", "grid", "point", "bar",                 # legacy renderer
     "points1_arrow", "points9_arrow",                # new renderer (preferred)
+    "points9_arrow_len0",                            # points9_arrow with arrow_length_scale=0 (dots only, no force info)
+    "binmarker",                                     # fixed-length arrow per finger iff binary contact (LIBERO binbars port)
     "bin_bar",                                       # current canonical (alpha-blended horizontal bar per finger)
     "points1_contact_flat", "points1_contact_spatial",
     "points9_color_flat", "points9_color_spatial",
